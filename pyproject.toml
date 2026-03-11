@@ -1,0 +1,31 @@
+[project]
+name = "montferrand-agent"
+version = "0.1.0"
+description = "AI SMS booking agent for service companies"
+readme = "README.md"
+authors = [
+    { name = "jpelletierorg", email = "moi@jpelletier.org" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.135.1",
+    "httpx>=0.28.1",
+    "pydantic-ai>=1.66.0",
+    "pydantic-evals>=1.66.0",
+    "rich>=14.3.3",
+    "twilio>=9.10.3",
+    "typer>=0.24.1",
+]
+
+[project.scripts]
+montferrand = "montferrand_agent.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.10.2,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+]
