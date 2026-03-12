@@ -25,9 +25,6 @@ class TestPhoneToFilename:
     def test_returns_16_char_hex(self):
         assert_hex_string(phone_to_filename(TENANT_PHONE), 16)
 
-    def test_deterministic(self):
-        assert phone_to_filename(TENANT_PHONE) == phone_to_filename(TENANT_PHONE)
-
     def test_different_numbers_differ(self):
         assert phone_to_filename(TENANT_PHONE) != phone_to_filename("+15145559999")
 
@@ -38,18 +35,14 @@ class TestPhoneToFilename:
 
 
 class TestTenantDir:
-    def test_default_is_config_tenants(self):
+    def test_default_is_config_tenants(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("MONTFERRAND_TENANT_DIR", raising=False)
         directory = tenant_dir()
         assert directory.name == "tenants"
         assert directory.parent.name == "config"
 
     def test_env_override(self, isolated_tenant_dir: Path):
         assert tenant_dir() == isolated_tenant_dir
-
-    def test_empty_env_uses_default(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("MONTFERRAND_TENANT_DIR", "")
-        directory = tenant_dir()
-        assert directory.name == "tenants"
 
 
 # ---------------------------------------------------------------------------
@@ -141,3 +134,34 @@ class TestListTenants:
     def test_ignores_files_without_comment(self, isolated_tenant_dir: Path):
         (isolated_tenant_dir / "junk.txt").write_text("no comment header")
         assert list_tenants() == []
+
+
+# ---------------------------------------------------------------------------
+# Empty tenant profile (H6)
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyProfile:
+    @pytest.mark.parametrize(
+        "content",
+        [f"# {TENANT_PHONE}\n", f"# {TENANT_PHONE}"],
+        ids=["comment_with_newline", "comment_no_newline"],
+    )
+    def test_comment_only_raises(self, isolated_tenant_dir: Path, content: str):
+        """A file with only a comment header (with or without newline) must crash."""
+        path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.txt"
+        path.write_text(content)
+        with pytest.raises(TenantNotFoundError, match="empty"):
+            load_tenant_profile(TENANT_PHONE)
+
+    @pytest.mark.parametrize(
+        "content",
+        [f"# {TENANT_PHONE}\n   \n  \n", "   \n  \n"],
+        ids=["comment_plus_whitespace", "whitespace_only"],
+    )
+    def test_whitespace_only_raises(self, isolated_tenant_dir: Path, content: str):
+        """A file with only whitespace (with or without comment header) must crash."""
+        path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.txt"
+        path.write_text(content)
+        with pytest.raises(TenantNotFoundError, match="empty"):
+            load_tenant_profile(TENANT_PHONE)

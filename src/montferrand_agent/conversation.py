@@ -4,6 +4,14 @@ Handles message history keyed by conversation ID, with an in-memory cache
 backed by NDJSON files on disk.  Exposes a single ``process_message``
 entry point that the CLI, eval harness, and SMS webhook all call.
 
+Conversation files are stored in tenant-scoped subdirectories::
+
+    {data_dir}/{tenant_hash}/{conversation_id}.ndjson
+
+where ``tenant_hash`` is derived from the Twilio phone number (same hash
+used by ``tenant.py`` for config files).  This structure allows wiping
+all conversations for a specific tenant via ``reset_tenant()``.
+
 The conversation key is always a plain string — callers decide how to
 produce it (random for CLI/evals, deterministic hash for SMS via
 ``conversation_key_for_sms``).
@@ -11,8 +19,11 @@ produce it (random for CLI/evals, deterministic hash for SMS via
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import mimetypes
+import shutil
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -24,6 +35,8 @@ from pydantic_ai import BinaryContent, UserContent
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.usage import RunUsage
 
+logger = logging.getLogger(__name__)
+
 from montferrand_agent.agent import (
     PROJECT_ROOT,
     dir_from_env,
@@ -32,6 +45,7 @@ from montferrand_agent.agent import (
     render_prompt,
 )
 from montferrand_agent.models import Dialog, Report
+from montferrand_agent.tenant import phone_to_filename
 
 
 class ConversationError(RuntimeError):
@@ -61,33 +75,48 @@ def _data_dir() -> Path:
     return dir_from_env("MONTFERRAND_DATA_DIR", _DEFAULT_DATA_DIR)
 
 
-def _conversation_path(conversation_id: str) -> Path:
+def _tenant_data_dir(twilio_number: str) -> Path:
+    """Return the tenant-scoped subdirectory for conversation files."""
+    return _data_dir() / phone_to_filename(twilio_number)
+
+
+def _conversation_path(conversation_id: str, twilio_number: str) -> Path:
     """Return the NDJSON file path for a conversation."""
-    return _data_dir() / f"{conversation_id}.ndjson"
+    return _tenant_data_dir(twilio_number) / f"{conversation_id}.ndjson"
 
 
-def _load_history_from_disk(conversation_id: str) -> list[ModelMessage]:
+def _load_history_from_disk(
+    conversation_id: str, twilio_number: str
+) -> list[ModelMessage]:
     """Read a conversation's full history from its NDJSON file."""
-    path = _conversation_path(conversation_id)
+    path = _conversation_path(conversation_id, twilio_number)
     if not path.exists():
         return []
 
     messages: list[ModelMessage] = []
-    for line in path.read_bytes().splitlines():
+    for line_num, line in enumerate(path.read_bytes().splitlines(), start=1):
         line = line.strip()
-        if line:
+        if not line:
+            continue
+        try:
             messages.append(_ModelMessageAdapter.validate_json(line))
+        except Exception:
+            logger.warning(
+                "Skipping corrupted NDJSON line %d in %s",
+                line_num,
+                path,
+            )
     return messages
 
 
 def _append_messages_to_disk(
-    conversation_id: str, messages: list[ModelMessage]
+    conversation_id: str, messages: list[ModelMessage], twilio_number: str
 ) -> None:
     """Append new messages to the conversation's NDJSON file."""
     if not messages:
         return
 
-    path = _conversation_path(conversation_id)
+    path = _conversation_path(conversation_id, twilio_number)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("ab") as f:
@@ -134,9 +163,21 @@ class ConversationCost:
 
 _histories: dict[str, list[ModelMessage]] = {}
 _costs: dict[str, ConversationCost] = {}
+_locks: dict[str, asyncio.Lock] = {}
 
 
-def _get_history(conversation_id: str) -> list[ModelMessage]:
+def _get_lock(conversation_id: str) -> asyncio.Lock:
+    """Return (or create) the async lock for a conversation.
+
+    Serializes concurrent turns for the same conversation so that
+    history reads and writes never interleave.
+    """
+    if conversation_id not in _locks:
+        _locks[conversation_id] = asyncio.Lock()
+    return _locks[conversation_id]
+
+
+def _get_history(conversation_id: str, twilio_number: str) -> list[ModelMessage]:
     """Return a copy of the message history for a conversation.
 
     Checks the in-memory cache first, then falls back to disk.
@@ -145,7 +186,7 @@ def _get_history(conversation_id: str) -> list[ModelMessage]:
         return list(_histories[conversation_id])
 
     # Cache miss — try loading from NDJSON file
-    messages = _load_history_from_disk(conversation_id)
+    messages = _load_history_from_disk(conversation_id, twilio_number)
     if messages:
         _histories[conversation_id] = messages
     return list(messages)
@@ -155,11 +196,12 @@ def _save_history(
     conversation_id: str,
     messages: list[ModelMessage],
     previous_message_count: int,
+    twilio_number: str,
 ) -> None:
     """Persist the full message history (in-memory + append new to disk)."""
     _histories[conversation_id] = messages
     new_messages = messages[previous_message_count:]
-    _append_messages_to_disk(conversation_id, new_messages)
+    _append_messages_to_disk(conversation_id, new_messages, twilio_number)
 
 
 def get_cost(conversation_id: str) -> ConversationCost:
@@ -167,13 +209,55 @@ def get_cost(conversation_id: str) -> ConversationCost:
     return _costs.get(conversation_id, ConversationCost())
 
 
-def reset(conversation_id: str) -> None:
-    """Clear all state for a conversation (memory and disk)."""
+def reset(conversation_id: str, twilio_number: str) -> None:
+    """Clear all state for a single conversation (memory and disk)."""
     _histories.pop(conversation_id, None)
     _costs.pop(conversation_id, None)
-    path = _conversation_path(conversation_id)
+    _locks.pop(conversation_id, None)
+    path = _conversation_path(conversation_id, twilio_number)
     if path.exists():
         path.unlink()
+
+
+def reset_tenant(twilio_number: str) -> int:
+    """Delete all conversation data for a tenant.
+
+    Removes the tenant's conversation subdirectory and all NDJSON files
+    in it.  Also clears any matching in-memory state.
+
+    Returns the number of conversation files deleted.
+    """
+    tenant_dir = _tenant_data_dir(twilio_number)
+
+    # Count files before deletion
+    count = 0
+    if tenant_dir.exists():
+        count = sum(1 for f in tenant_dir.iterdir() if f.suffix == ".ndjson")
+
+        # Clear in-memory state for conversations in this directory
+        conversation_ids = [
+            f.stem for f in tenant_dir.iterdir() if f.suffix == ".ndjson"
+        ]
+        for cid in conversation_ids:
+            _histories.pop(cid, None)
+            _costs.pop(cid, None)
+            _locks.pop(cid, None)
+
+        # Remove the entire directory
+        shutil.rmtree(tenant_dir)
+
+    return count
+
+
+def list_conversations(twilio_number: str) -> list[str]:
+    """List all conversation IDs for a tenant.
+
+    Returns a list of conversation IDs (NDJSON filename stems).
+    """
+    tenant_dir = _tenant_data_dir(twilio_number)
+    if not tenant_dir.exists():
+        return []
+    return sorted(f.stem for f in tenant_dir.iterdir() if f.suffix == ".ndjson")
 
 
 def new_conversation_id() -> str:
@@ -288,26 +372,36 @@ async def process_message(
     images: Sequence[Path] | None = None,
     *,
     tenant_profile: str,
+    twilio_number: str,
 ) -> Union[Dialog, Report]:
     """Run one turn of conversation and return Dialog or Report.
 
     The *tenant_profile* parameter carries the company-specific text that
-    is injected into the master prompt template.  This parameter is
-    required — there is no silent fallback.  If a caller does not have
-    a tenant profile, that is a configuration error and should crash.
+    is injected into the master prompt template.  The *twilio_number*
+    identifies which tenant's conversation subdirectory to use for
+    persistence.  Both parameters are required — there is no silent
+    fallback.
 
     Raises:
         ConversationError: If the agent call fails.
     """
-    history = _get_history(conversation_id)
-    prev_msg_count = len(history)
-    prompt = _build_prompt(text, images)
+    async with _get_lock(conversation_id):
+        history = _get_history(conversation_id, twilio_number)
+        prev_msg_count = len(history)
+        prompt = _build_prompt(text, images)
 
-    instructions = render_prompt(tenant_profile)
-    result = await _run_booking_agent(prompt, history, instructions)
+        instructions = render_prompt(tenant_profile)
+        result = await _run_booking_agent(prompt, history, instructions)
 
-    all_messages = result.all_messages()
-    _save_history(conversation_id, all_messages, prev_msg_count)
-    _update_cost(conversation_id, all_messages, prev_msg_count, result.usage())
+        all_messages = result.all_messages()
+        _save_history(conversation_id, all_messages, prev_msg_count, twilio_number)
 
-    return result.output
+        try:
+            _update_cost(conversation_id, all_messages, prev_msg_count, result.usage())
+        except Exception:
+            logger.exception(
+                "Failed to update cost for conversation %s (reply still delivered)",
+                conversation_id,
+            )
+
+        return result.output

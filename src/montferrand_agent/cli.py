@@ -8,6 +8,7 @@ Provides subcommands:
     uv run montferrand onboard            — register a new tenant
     uv run montferrand tenant edit        — edit a tenant's prompt
     uv run montferrand tenant list        — list configured tenants
+    uv run montferrand reset              — wipe conversation data for a tenant
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from montferrand_agent.conversation import (
     new_conversation_id,
     process_message,
     reset,
+    reset_tenant,
 )
 from montferrand_agent.models import Report
 from montferrand_agent.tenant import (
@@ -223,12 +225,15 @@ def _end_conversation(conversation_id: str) -> None:
     _print_cost(get_cost(conversation_id))
 
 
-def _resolve_cli_tenant_profile() -> str:
-    """Load the demo tenant's profile for the interactive CLI.
+def _resolve_cli_tenant() -> tuple[str, str]:
+    """Load the demo tenant's profile and number for the interactive CLI.
 
     Reads ``MONTFERRAND_DEMO_TENANT`` and loads the corresponding tenant
     profile from disk.  Crashes if the env var is not set or the tenant
     is not found — there is no silent fallback.
+
+    Returns:
+        (twilio_number, tenant_profile) tuple.
     """
     demo_number = os.environ.get("MONTFERRAND_DEMO_TENANT", "").strip()
     if not demo_number:
@@ -237,12 +242,13 @@ def _resolve_cli_tenant_profile() -> str:
             "Set it to a Twilio number with a configured tenant profile."
         )
     try:
-        return load_tenant_profile(demo_number)
+        profile = load_tenant_profile(demo_number)
     except TenantNotFoundError:
         _fatal(
             f"Demo tenant {demo_number} not found. "
             f"Run 'montferrand onboard' to create it first."
         )
+    return demo_number, profile
 
 
 @app.command()
@@ -259,7 +265,7 @@ async def _cli_loop() -> None:
         _print_error(f"Erreur de configuration: {exc}")
         return
 
-    tenant_profile = _resolve_cli_tenant_profile()
+    twilio_number, tenant_profile = _resolve_cli_tenant()
 
     console.print(
         Panel(
@@ -290,7 +296,7 @@ async def _cli_loop() -> None:
 
         if stripped.lower() == "!reset":
             _end_conversation(conversation_id)
-            reset(conversation_id)
+            reset(conversation_id, twilio_number)
             conversation_id = new_conversation_id()
             conversation_over = False
             console.print("[dim]Conversation reinitialised.[/dim]\n")
@@ -320,6 +326,7 @@ async def _cli_loop() -> None:
                 text,
                 images or None,
                 tenant_profile=tenant_profile,
+                twilio_number=twilio_number,
             )
         except ConversationError as exc:
             _print_error(f"Erreur: {exc}")
@@ -489,6 +496,97 @@ def tenant_list() -> None:
         table.add_row(phone, str(path))
 
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# reset subcommand
+# ---------------------------------------------------------------------------
+
+
+def _select_tenant_interactive() -> str:
+    """Display configured tenants and let the user pick one.
+
+    Returns the selected Twilio phone number, or exits if none available.
+    """
+    tenants = list_tenants()
+    if not tenants:
+        _fatal("No tenants configured.")
+
+    console.print()
+    for i, (phone, _path) in enumerate(tenants, 1):
+        console.print(f"  [bold]{i}.[/bold] {phone}")
+    console.print()
+
+    try:
+        choice = console.input("Select tenant number: ")
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        raise typer.Exit(0)
+
+    try:
+        idx = int(choice.strip()) - 1
+        if idx < 0 or idx >= len(tenants):
+            _fatal(f"Invalid choice: {choice}")
+        return tenants[idx][0]
+    except ValueError:
+        _fatal(f"Invalid choice: {choice}")
+
+
+def _reset_remote(host: str, twilio_number: str) -> None:
+    """DELETE conversations for a tenant on a remote Montferrand server."""
+    token = _require_admin_token()
+    url = f"https://{host}/admin/tenants/{twilio_number}/conversations"
+    response = httpx.delete(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    if response.status_code == 200:
+        count = response.json().get("deleted", "?")
+        console.print(
+            f"[green]Deleted {count} conversation(s) for {twilio_number} "
+            f"on {host}[/green]"
+        )
+    else:
+        _fatal(f"Remote error {response.status_code}: {response.text}")
+
+
+@app.command("reset")
+def reset_cmd(
+    twilio_number: str | None = typer.Option(
+        None,
+        "--twilio-number",
+        "-n",
+        help="Tenant phone number (E.164). If omitted, select interactively.",
+    ),
+    host: str | None = typer.Option(
+        None,
+        "--host",
+        help="Reset on a remote server (falls back to MONTFERRAND_HOST)",
+    ),
+    local: bool = typer.Option(
+        False,
+        "--local",
+        "-l",
+        help="Reset locally even if MONTFERRAND_HOST is set",
+    ),
+) -> None:
+    """Wipe all conversation data for a tenant."""
+    if twilio_number is None:
+        twilio_number = _select_tenant_interactive()
+
+    remote = _resolve_host(host, local=local)
+
+    if remote:
+        _reset_remote(remote, twilio_number)
+    else:
+        count = reset_tenant(twilio_number)
+        if count == 0:
+            console.print(f"[dim]No conversations found for {twilio_number}.[/dim]")
+        else:
+            console.print(
+                f"[green]Deleted {count} conversation(s) for {twilio_number}.[/green]"
+            )
 
 
 # ---------------------------------------------------------------------------

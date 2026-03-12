@@ -28,6 +28,10 @@ COPY --from=builder /app/.venv .venv/
 # Copy .env so load_dotenv() finds it at /app/.env
 COPY .env .env
 
+# Create data directories (Fly.io volume mounts over /opt/montferrand,
+# but this ensures they exist for local docker run without a volume)
+RUN mkdir -p /opt/montferrand/tenants /opt/montferrand/conversations
+
 # Ensure the venv is on PATH
 ENV PATH="/app/.venv/bin:$PATH"
 

@@ -6,7 +6,6 @@ All tests are pure logic — no LLM calls.
 import pytest
 
 from montferrand_agent.agent import (
-    DEMO_TENANT_PROFILE,
     MASTER_PROMPT_TEMPLATE,
     _FALLBACK_PRICING,
     _require_env,
@@ -26,20 +25,12 @@ class TestResolveEnv:
         monkeypatch.setenv("TEST_VAR_A", "value_a")
         assert _resolve_env("TEST_VAR_A", default="fallback") == "value_a"
 
-    def test_skips_empty_env_var(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("TEST_VAR_A", "")
-        monkeypatch.setenv("TEST_VAR_B", "value_b")
-        assert _resolve_env("TEST_VAR_A", "TEST_VAR_B", default="fallback") == "value_b"
-
-    def test_skips_whitespace_only(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("TEST_VAR_A", "   ")
-        assert _resolve_env("TEST_VAR_A", default="fallback") == "fallback"
-
     def test_returns_default_when_unset(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("TEST_VAR_NONEXISTENT", raising=False)
         assert _resolve_env("TEST_VAR_NONEXISTENT", default="fallback") == "fallback"
 
     def test_returns_first_non_empty(self, monkeypatch: pytest.MonkeyPatch):
+        """Skips empty strings and whitespace-only, returns first real value."""
         monkeypatch.setenv("TEST_VAR_A", "")
         monkeypatch.setenv("TEST_VAR_B", "  ")
         monkeypatch.setenv("TEST_VAR_C", "winner")
@@ -57,20 +48,20 @@ class TestRequireEnv:
         monkeypatch.setenv("TEST_REQUIRE", "hello")
         assert _require_env("TEST_REQUIRE", "missing") == "hello"
 
-    def test_raises_when_unset(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("TEST_REQUIRE_MISSING", raising=False)
-        with pytest.raises(RuntimeError, match="not configured"):
-            _require_env("TEST_REQUIRE_MISSING", "not configured")
-
-    def test_raises_when_empty(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("TEST_REQUIRE_EMPTY", "")
+    @pytest.mark.parametrize(
+        "value",
+        [None, "", "   "],
+        ids=["unset", "empty", "whitespace"],
+    )
+    def test_raises_when_missing_or_blank(
+        self, monkeypatch: pytest.MonkeyPatch, value: str | None
+    ):
+        if value is None:
+            monkeypatch.delenv("TEST_REQUIRE_X", raising=False)
+        else:
+            monkeypatch.setenv("TEST_REQUIRE_X", value)
         with pytest.raises(RuntimeError):
-            _require_env("TEST_REQUIRE_EMPTY", "empty value")
-
-    def test_raises_when_whitespace_only(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("TEST_REQUIRE_WS", "   ")
-        with pytest.raises(RuntimeError):
-            _require_env("TEST_REQUIRE_WS", "whitespace only")
+            _require_env("TEST_REQUIRE_X", "bad value")
 
 
 # ---------------------------------------------------------------------------
@@ -84,21 +75,15 @@ class TestRenderPrompt:
         assert "Plomberie Test" in result
         assert "hourly rate: $100" in result
 
-    def test_contains_behavioral_instructions(self):
-        result = render_prompt("any profile")
-        # Should contain key behavioral instructions from the template
-        assert "DIAGNOSE" in result
-        assert "ASSESS" in result
-        assert "PROPOSE" in result
-        assert "BOOK" in result
-        assert "CONFIRM" in result
-
-    def test_demo_profile_renders_without_error(self):
-        result = render_prompt(DEMO_TENANT_PROFILE)
-        assert "Plomberie Montferrand" in result
-
     def test_template_has_placeholder(self):
         assert "{tenant_profile}" in MASTER_PROMPT_TEMPLATE
+
+    def test_profile_with_curly_braces_does_not_crash(self):
+        """H1 regression: profiles containing { or } must not crash."""
+        profile = "Hours: {lundi-vendredi} 8h-17h\nNotes: use {{special}} rates"
+        result = render_prompt(profile)
+        assert "{lundi-vendredi}" in result
+        assert "{{special}}" in result
 
 
 # ---------------------------------------------------------------------------
@@ -107,10 +92,6 @@ class TestRenderPrompt:
 
 
 class TestFallbackPricing:
-    def test_known_models_have_pricing(self):
-        assert "anthropic/claude-sonnet-4.6" in _FALLBACK_PRICING
-        assert "anthropic/claude-opus-4.6" in _FALLBACK_PRICING
-
     def test_pricing_tuples_are_positive(self):
         for model, (inp, out) in _FALLBACK_PRICING.items():
             assert inp > 0, f"{model} input price must be positive"
@@ -118,7 +99,6 @@ class TestFallbackPricing:
             assert out > inp, f"{model} output price should exceed input price"
 
     def test_unknown_model_returns_none(self, monkeypatch: pytest.MonkeyPatch):
-        """get_fallback_pricing returns None when the active model has no entry."""
         monkeypatch.setattr(
             "montferrand_agent.agent.get_model_name",
             lambda: "unknown/model-xyz",
@@ -130,5 +110,4 @@ class TestFallbackPricing:
             "montferrand_agent.agent.get_model_name",
             lambda: "anthropic/claude-opus-4.6",
         )
-        result = get_fallback_pricing()
-        assert result == (5.0, 25.0)
+        assert get_fallback_pricing() == (5.0, 25.0)

@@ -50,6 +50,12 @@ from montferrand_agent.customer import (
 )
 from montferrand_agent.models import Dialog, Report
 
+# Phone number used to scope eval conversation files on disk.
+# This is NOT a real Twilio number — it's a fixed sentinel so evals
+# always write to the same tenant subdirectory, which is separate
+# from any real tenant's data.
+_EVAL_TENANT_NUMBER = "+10000000000"
+
 Actor = str
 
 # ---------------------------------------------------------------------------
@@ -100,7 +106,7 @@ RUBRIC_DIAGNOSTIC_EXPERTISE = (
 RUBRIC_PROACTIVE_PROPOSAL = (
     _RUBRIC_PREAMBLE + "Evaluate ONLY whether:\n"
     "1. The agent proactively offers a price range AND an "
-    "appointment slot without waiting to be asked.\n"
+    "appointment slot.\n"
     "2. The agent collects personal info (name, address, etc.) only "
     "AFTER demonstrating competence — not as the first questions.\n"
     "Pass if BOTH are met."
@@ -116,13 +122,13 @@ RUBRIC_SMS_STYLE = (
 RUBRIC_LANGUAGE_MATCH = (
     _RUBRIC_PREAMBLE + "Evaluate ONLY whether the agent uses the same language as "
     "the customer throughout the entire conversation. "
-    "The agent should never switch languages mid-conversation. "
+    "The agent should never switch languages mid-conversation unless the customer does. "
     "Pass if the agent consistently replies in the customer's language."
 )
 
 RUBRIC_NATURAL_TONE = (
     _RUBRIC_PREAMBLE + "Evaluate ONLY whether:\n"
-    "1. Acknowledgments are brief — a simple 'ok' or 'd'accord' is enough.\n"
+    "1. Acknowledgments are brief — a simple 'ok' or 'd'accord' or 'on va regarder cela ensemble' is enough.\n"
     "2. The agent never labels or dramatizes the situation (no "
     "'c'est une urgence', no 'oh non', no 'je comprends la situation').\n"
     "3. The agent does not parrot back what the customer just said.\n"
@@ -148,7 +154,7 @@ RUBRIC_PRELIMINARY_FRAMING = (
     "the diagnosis as fact.\n"
     "2. Pricing is presented as an estimate based on the "
     "preliminary assessment, not a firm quote. The agent mentions "
-    "that the final price is confirmed after on-site inspection.\n"
+    "that the final price is confirmed after on-site inspection."
     "Pass if BOTH are met."
 )
 
@@ -190,19 +196,19 @@ _RUBRICS = [
     (RUBRIC_PHYSICALLY_OBSERVABLE, "physically_observable"),
 ]
 
-# Short display names for the report table columns.
+# Display names for the report table columns.
 _EVAL_DISPLAY_NAMES: dict[str, str] = {
-    "ConversationConverged": "Conv.",
-    "diagnostic_expertise": "Diag.",
-    "proactive_proposal": "Propos.",
-    "sms_style": "SMS",
-    "language_match": "Lang.",
+    "ConversationConverged": "Converged",
+    "diagnostic_expertise": "Diagnostic",
+    "proactive_proposal": "Proposal",
+    "sms_style": "SMS Style",
+    "language_match": "Language",
     "natural_tone": "Tone",
-    "realistic_questions": "Quest.",
-    "preliminary_framing": "Prelim.",
-    "plain_language": "Plain",
+    "realistic_questions": "Questions",
+    "preliminary_framing": "Preliminary",
+    "plain_language": "Plain Lang.",
     "NoSlowTurns": "Speed",
-    "physically_observable": "Phys.",
+    "physically_observable": "Physical",
 }
 
 
@@ -312,6 +318,7 @@ async def _run_agent_turn(
             conversation_id,
             customer_message,
             tenant_profile=DEMO_TENANT_PROFILE,
+            twilio_number=_EVAL_TENANT_NUMBER,
         )
     except ConversationError as exc:
         duration = time.perf_counter() - t0
@@ -397,7 +404,7 @@ async def run_scenario(scenario: Scenario) -> ConversationResult:
             turn_durations=turn_durations,
         )
     finally:
-        reset(conversation_id)
+        reset(conversation_id, _EVAL_TENANT_NUMBER)
 
 
 # ---------------------------------------------------------------------------

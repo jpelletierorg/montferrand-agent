@@ -40,8 +40,8 @@ class TestPassFail:
 
 class TestDisplayName:
     def test_known_name(self):
-        assert _display_name("ConversationConverged") == "Conv."
-        assert _display_name("diagnostic_expertise") == "Diag."
+        assert _display_name("ConversationConverged") == "Converged"
+        assert _display_name("diagnostic_expertise") == "Diagnostic"
         assert _display_name("NoSlowTurns") == "Speed"
 
     def test_unknown_name_returns_itself(self):

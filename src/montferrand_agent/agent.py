@@ -171,14 +171,20 @@ Do not ask for a photo when it would not be useful (e.g., no hot water, slow dra
 # ---------------------------------------------------------------------------
 
 DEMO_TENANT_PROFILE = """\
-- Business name: Plomberie Montferrand
+- Business name: Plomberie Demo
 - Scope: residential plumbing and light commercial
 - Service area: Longueuil, Brossard, Saint-Lambert, Boucherville, Greenfield Park, and nearby Montreal-area municipalities
 - Business hours: Monday to Saturday, 7:30 AM to 6:00 PM
-- Available appointment slots: today 3 PM to 5 PM, tomorrow 8 AM to 10 AM, tomorrow 1 PM to 3 PM
+- Available appointment slots: we service customer from monday through friday from 9 am to 5 pm. 
+  You book service call in those service windows: 9 am to 12 pm, 1 pm to 5pm. You can only book 2 service call 
+  from 9 am to 12 pm and 3 service calls from 1 pm to 5pm each day.
 - Pricing (estimates only, final price confirmed after on-site inspection):
   - diagnostic visit: $89 CAD
-  - hourly rate of 120$ CAD. Minimum 1 hour."""
+  - hourly rate of 120$ CAD. Minimum 1 hour.
+  - when providing estimates to customer, you reason about the time it will 
+    take to accomplish the job. so you state the rate and then the time you 
+    believe such a job takes in the field.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +199,7 @@ def render_prompt(tenant_profile: str) -> str:
     All callers must provide a tenant profile explicitly — there is no
     silent fallback.
     """
-    return MASTER_PROMPT_TEMPLATE.format(tenant_profile=tenant_profile)
+    return MASTER_PROMPT_TEMPLATE.replace("{tenant_profile}", tenant_profile)
 
 
 # ---------------------------------------------------------------------------

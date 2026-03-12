@@ -17,7 +17,7 @@ primary_region = 'yyz'
 
 [mounts]
   source = 'montferrand_data'
-  destination = '/data'
+  destination = '/opt/montferrand'
 
 [[vm]]
   memory = '1gb'

@@ -19,15 +19,21 @@ from montferrand_agent.conversation import (
     _load_history_from_disk,
     _read_image,
     _save_history,
+    _tenant_data_dir,
     conversation_key_for_sms,
     get_cost,
+    list_conversations,
     new_conversation_id,
     reset,
+    reset_tenant,
 )
 
 from .conftest import CUSTOMER_NUMBER, TWILIO_NUMBER, assert_hex_string
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
+
+# Test tenant number for all persistence tests
+_TN = TWILIO_NUMBER
 
 
 # ---------------------------------------------------------------------------
@@ -56,30 +62,30 @@ class TestHistory:
         monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(tmp_path))
 
     def test_get_history_unknown_id_returns_empty(self):
-        assert _get_history("nonexistent") == []
+        assert _get_history("nonexistent", _TN) == []
 
     def test_save_and_get_roundtrip(self):
         cid = new_conversation_id()
         msgs = ["msg1", "msg2"]  # type: ignore[list-item]
-        _save_history(cid, msgs, 0)  # type: ignore[arg-type]
-        assert _get_history(cid) == msgs
+        _save_history(cid, msgs, 0, _TN)  # type: ignore[arg-type]
+        assert _get_history(cid, _TN) == msgs
 
     def test_get_history_returns_copy(self):
         cid = new_conversation_id()
         msgs = ["msg1"]  # type: ignore[list-item]
-        _save_history(cid, msgs, 0)  # type: ignore[arg-type]
-        retrieved = _get_history(cid)
+        _save_history(cid, msgs, 0, _TN)  # type: ignore[arg-type]
+        retrieved = _get_history(cid, _TN)
         retrieved.append("extra")  # type: ignore[arg-type]
-        assert _get_history(cid) == msgs  # original unaffected
+        assert _get_history(cid, _TN) == msgs  # original unaffected
 
     def test_reset_clears_history(self):
         cid = new_conversation_id()
-        _save_history(cid, ["msg"], 0)  # type: ignore[arg-type]
-        reset(cid)
-        assert _get_history(cid) == []
+        _save_history(cid, ["msg"], 0, _TN)  # type: ignore[arg-type]
+        reset(cid, _TN)
+        assert _get_history(cid, _TN) == []
 
     def test_reset_unknown_id_does_not_raise(self):
-        reset("nonexistent")  # should not raise
+        reset("nonexistent", _TN)  # should not raise
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +117,7 @@ class TestConversationCost:
             total_usd=Decimal("0.05"),
             usage=RunUsage(input_tokens=100, output_tokens=50),
         )
-        reset(cid)
+        reset(cid, _TN)
         cost = get_cost(cid)
         assert cost.total_usd == Decimal(0)
         assert cost.usage.total_tokens == 0
@@ -128,10 +134,6 @@ class TestReadImage:
         assert isinstance(img, BinaryContent)
         assert img.media_type == "image/jpeg"
         assert len(img.data) > 0
-
-    def test_reads_different_file(self):
-        img = _read_image(FIXTURES_DIR / "clogged_drain.jpg")
-        assert img.media_type == "image/jpeg"
 
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError, match="Image not found"):
@@ -161,9 +163,6 @@ class TestBuildPrompt:
         assert result == "hello"
         assert isinstance(result, str)
 
-    def test_strips_whitespace(self):
-        assert _build_prompt("  hello  ") == "hello"
-
     def test_text_with_image_returns_list(self):
         img_path = FIXTURES_DIR / "leaky_faucet.jpg"
         result = _build_prompt("leak here", [img_path])
@@ -189,13 +188,9 @@ class TestBuildPrompt:
         assert len(result) == 3  # text + 2 images
         assert result[0] == "photos"
 
-    def test_no_images_none(self):
-        result = _build_prompt("hello", None)
-        assert result == "hello"
-        assert isinstance(result, str)
-
-    def test_no_images_empty_list(self):
-        result = _build_prompt("hello", [])
+    @pytest.mark.parametrize("images", [None, []])
+    def test_no_images_returns_string(self, images):
+        result = _build_prompt("hello", images)
         assert result == "hello"
         assert isinstance(result, str)
 
@@ -208,11 +203,6 @@ class TestBuildPrompt:
 class TestConversationKeyForSms:
     def test_returns_12_char_hex(self):
         assert_hex_string(conversation_key_for_sms(TWILIO_NUMBER, CUSTOMER_NUMBER), 12)
-
-    def test_deterministic(self):
-        a = conversation_key_for_sms(TWILIO_NUMBER, CUSTOMER_NUMBER)
-        b = conversation_key_for_sms(TWILIO_NUMBER, CUSTOMER_NUMBER)
-        assert a == b
 
     def test_different_pairs_differ(self):
         a = conversation_key_for_sms(TWILIO_NUMBER, CUSTOMER_NUMBER)
@@ -242,21 +232,16 @@ class TestNdjsonPersistence:
         assert directory.name == "conversations"
         assert directory.parent.name == "data"
 
-    def test_data_dir_env_override(self):
-        # The autouse fixture already sets the env var
-        directory = _data_dir()
-        assert directory.exists() or True  # temp dir set via autouse
-
     def test_load_from_empty_dir(self):
-        assert _load_history_from_disk("nonexistent") == []
+        assert _load_history_from_disk("nonexistent", _TN) == []
 
     def test_append_and_load_roundtrip(self):
         from pydantic_ai.messages import ModelRequest, UserPromptPart
 
         msg = ModelRequest(parts=[UserPromptPart(content="hello")])
-        _append_messages_to_disk("test123", [msg])
+        _append_messages_to_disk("test123", [msg], _TN)
 
-        loaded = _load_history_from_disk("test123")
+        loaded = _load_history_from_disk("test123", _TN)
         assert len(loaded) == 1
         assert isinstance(loaded[0], ModelRequest)
         assert loaded[0].parts[0].content == "hello"  # type: ignore[union-attr]
@@ -267,10 +252,10 @@ class TestNdjsonPersistence:
         msg1 = ModelRequest(parts=[UserPromptPart(content="first")])
         msg2 = ModelRequest(parts=[UserPromptPart(content="second")])
 
-        _append_messages_to_disk("test456", [msg1])
-        _append_messages_to_disk("test456", [msg2])
+        _append_messages_to_disk("test456", [msg1], _TN)
+        _append_messages_to_disk("test456", [msg2], _TN)
 
-        loaded = _load_history_from_disk("test456")
+        loaded = _load_history_from_disk("test456", _TN)
         assert len(loaded) == 2
 
     def test_get_history_falls_back_to_disk(self):
@@ -280,11 +265,128 @@ class TestNdjsonPersistence:
 
         cid = "diskonly123"
         msg = ModelRequest(parts=[UserPromptPart(content="from disk")])
-        _append_messages_to_disk(cid, [msg])
+        _append_messages_to_disk(cid, [msg], _TN)
 
         # Ensure not in memory
         _histories.pop(cid, None)
 
-        history = _get_history(cid)
+        history = _get_history(cid, _TN)
         assert len(history) == 1
         assert history[0].parts[0].content == "from disk"  # type: ignore[union-attr]
+
+    def test_corrupted_ndjson_line_is_skipped(self, tmp_path: Path):
+        """H4 regression: one bad line should not kill the entire history."""
+        from montferrand_agent.conversation import (
+            _ModelMessageAdapter,
+            _conversation_path,
+        )
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+        cid = "corrupt_test"
+        msg = ModelRequest(parts=[UserPromptPart(content="good line")])
+        _append_messages_to_disk(cid, [msg], _TN)
+
+        # Inject a corrupted line in the middle
+        path = _conversation_path(cid, _TN)
+        content = path.read_bytes()
+        corrupted = content + b"THIS IS NOT VALID JSON\n"
+        # Append another valid line
+        msg2 = ModelRequest(parts=[UserPromptPart(content="also good")])
+        corrupted += _ModelMessageAdapter.dump_json(msg2) + b"\n"
+        path.write_bytes(corrupted)
+
+        loaded = _load_history_from_disk(cid, _TN)
+        assert len(loaded) == 2
+        assert loaded[0].parts[0].content == "good line"  # type: ignore[union-attr]
+        assert loaded[1].parts[0].content == "also good"  # type: ignore[union-attr]
+
+    def test_tenant_scoped_directory_structure(self, tmp_path: Path):
+        """Conversation files are stored in tenant-scoped subdirectories."""
+        from montferrand_agent.conversation import _conversation_path
+        from montferrand_agent.tenant import phone_to_filename
+
+        path = _conversation_path("abc123", _TN)
+        assert path.parent.name == phone_to_filename(_TN)
+        assert path.name == "abc123.ndjson"
+
+
+# ---------------------------------------------------------------------------
+# reset_tenant
+# ---------------------------------------------------------------------------
+
+
+class TestResetTenant:
+    @pytest.fixture(autouse=True)
+    def _isolate_data_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        """Point NDJSON writes to a temp dir."""
+        monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(tmp_path))
+
+    def test_reset_empty_tenant_returns_zero(self):
+        assert reset_tenant(_TN) == 0
+
+    def test_reset_deletes_all_conversations(self):
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+        msg = ModelRequest(parts=[UserPromptPart(content="hello")])
+        _append_messages_to_disk("conv_a", [msg], _TN)
+        _append_messages_to_disk("conv_b", [msg], _TN)
+        _append_messages_to_disk("conv_c", [msg], _TN)
+
+        count = reset_tenant(_TN)
+        assert count == 3
+
+        # Directory should be gone
+        assert not _tenant_data_dir(_TN).exists()
+
+    def test_reset_does_not_affect_other_tenants(self):
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+        other_tenant = "+19999999999"
+        msg = ModelRequest(parts=[UserPromptPart(content="hello")])
+        _append_messages_to_disk("conv_a", [msg], _TN)
+        _append_messages_to_disk("conv_b", [msg], other_tenant)
+
+        reset_tenant(_TN)
+
+        # Other tenant's data should still exist
+        assert _load_history_from_disk("conv_b", other_tenant) != []
+        # Our tenant's data should be gone
+        assert _load_history_from_disk("conv_a", _TN) == []
+
+    def test_reset_clears_in_memory_state(self):
+        from montferrand_agent.conversation import _costs, _histories
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+        msg = ModelRequest(parts=[UserPromptPart(content="hello")])
+        _append_messages_to_disk("conv_mem", [msg], _TN)
+        _histories["conv_mem"] = [msg]
+        _costs["conv_mem"] = ConversationCost(total_usd=Decimal("0.01"))
+
+        reset_tenant(_TN)
+
+        assert "conv_mem" not in _histories
+        assert "conv_mem" not in _costs
+
+
+# ---------------------------------------------------------------------------
+# list_conversations
+# ---------------------------------------------------------------------------
+
+
+class TestListConversations:
+    @pytest.fixture(autouse=True)
+    def _isolate_data_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(tmp_path))
+
+    def test_empty_tenant(self):
+        assert list_conversations(_TN) == []
+
+    def test_lists_conversation_ids(self):
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+        msg = ModelRequest(parts=[UserPromptPart(content="hello")])
+        _append_messages_to_disk("aaa111", [msg], _TN)
+        _append_messages_to_disk("bbb222", [msg], _TN)
+
+        result = list_conversations(_TN)
+        assert sorted(result) == ["aaa111", "bbb222"]

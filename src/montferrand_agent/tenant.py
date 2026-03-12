@@ -85,9 +85,17 @@ def load_tenant_profile(twilio_number: str) -> str:
     # Strip the header comment (first line starting with #)
     lines = text.split("\n", maxsplit=1)
     if lines and lines[0].startswith("#"):
-        return lines[1] if len(lines) > 1 else ""
+        profile = lines[1].strip() if len(lines) > 1 else ""
+    else:
+        profile = text.strip()
 
-    return text
+    if not profile:
+        raise TenantNotFoundError(
+            f"Tenant config for {twilio_number} is empty (file exists but "
+            f"contains no profile text): {path}"
+        )
+
+    return profile
 
 
 def save_tenant_profile(twilio_number: str, profile: str) -> Path:
