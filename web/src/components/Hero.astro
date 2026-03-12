@@ -1,0 +1,62 @@
+---
+---
+
+<section class="relative pt-24 md:pt-32 pb-12 md:pb-20 overflow-hidden">
+  <div class="mx-auto max-w-6xl px-4 md:px-8 flex flex-col md:flex-row items-center gap-8 md:gap-12">
+
+    <!-- Left: Mascot — on mobile, zoom in and clip the legs -->
+    <div class="flex-shrink-0 w-[22rem] sm:w-[24rem] md:w-[22rem] lg:w-[26rem] h-[250px] sm:h-[280px] md:h-auto overflow-hidden">
+      <img
+        src="/assets/mascot.png"
+        alt="Jos Montferrand - Mascot"
+        class="w-full h-auto drop-shadow-lg"
+        width="896"
+        height="1200"
+        loading="eager"
+      />
+    </div>
+
+    <!-- Right: Copy + SMS bubbles + CTAs — vertically centered -->
+    <div class="flex-1 text-center md:text-left">
+      <h1 class="font-serif text-4xl md:text-5xl lg:text-6xl font-bold text-primary leading-tight tracking-tight">
+        Répondez à tous <i>vos</i> clients, n'importe quand.
+      </h1>
+
+      <!-- SMS conversation preview -->
+      <div class="mt-8 space-y-1.5">
+        <!-- Customer message (right-aligned, blue iMessage outgoing) -->
+        <div class="flex flex-col items-end gap-0.5">
+          <div class="bg-[#007AFF] text-white rounded-[18px] rounded-br-[4px] px-3 py-2 max-w-[55%] sm:max-w-[50%]">
+            <p class="text-[13px] leading-snug">J'ai une fuite sous l'évier, est-ce que vous pouvez envoyer quelqu'un?</p>
+          </div>
+          <span class="text-[9px] text-gray-400 font-bold mr-0.5">Lu 21:47</span>
+        </div>
+        <!-- Montferrand reply (left-aligned, gray iMessage incoming) -->
+        <div class="flex flex-col items-start">
+          <div class="bg-[#E9E9EB] text-gray-900 rounded-[18px] rounded-bl-[4px] px-3 py-2 max-w-[55%] sm:max-w-[50%]">
+            <p class="text-[13px] leading-snug">Absolument! On peut envoyer un plombier demain entre 8h et 10h. Ça vous convient?</p>
+          </div>
+        </div>
+      </div>
+
+      <p class="mt-6 text-base text-muted-foreground max-w-xl mx-auto md:mx-0 leading-relaxed">
+        Soyez constamment disponible grâce à un assistant qui répond à vos clients, prend les rendez-vous et évite que des appels de service ne vous échappent pendant que vous êtes sur le terrain.
+      </p>
+
+      <div class="mt-7 flex flex-col sm:flex-row gap-4 items-center md:items-start">
+        <button id="hero-demo-trigger" class="inline-flex items-center justify-center px-8 py-4 text-base font-semibold rounded-full bg-accent text-accent-foreground hover:bg-accent-hover transition-colors shadow-md cursor-pointer">
+          Essayer la démo
+        </button>
+        <a href="#onboarding" class="inline-flex items-center justify-center px-8 py-4 text-base font-semibold rounded-full border-2 border-primary text-primary hover:bg-primary hover:text-primary-foreground transition-colors">
+          Commencer maintenant
+        </a>
+      </div>
+
+      <!-- Guarantee micro-proof -->
+      <p class="mt-4 text-sm text-muted-foreground flex items-center gap-1.5 justify-center md:justify-start">
+        <svg class="w-4 h-4 text-green-600 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11.5 14.5 15.5 10"/></svg>
+        30 jours sans risque. Satisfait ou remboursé.
+      </p>
+    </div>
+  </div>
+</section>

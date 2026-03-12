@@ -1,0 +1,59 @@
+---
+---
+
+<nav id="site-nav" class="fixed top-0 left-0 right-0 z-50 h-16 md:h-18 flex items-center border-b border-border/50 bg-background/80 backdrop-blur-md transition-colors duration-300">
+  <div class="mx-auto w-full max-w-6xl px-4 md:px-8 flex items-center justify-between">
+    <a href="/" class="font-serif text-xl md:text-2xl font-bold text-primary no-underline">
+      Montferrand
+    </a>
+
+    <!-- Mobile hamburger -->
+    <button id="nav-toggle" class="md:hidden flex flex-col gap-[5px] p-1" aria-label="Ouvrir le menu" aria-expanded="false">
+      <span class="block w-6 h-0.5 bg-primary transition-all"></span>
+      <span class="block w-6 h-0.5 bg-primary transition-all"></span>
+      <span class="block w-6 h-0.5 bg-primary transition-all"></span>
+    </button>
+
+    <!-- Desktop links -->
+    <div class="hidden md:flex items-center gap-6">
+      <a href="/#comment-ca-marche" class="text-sm font-medium text-foreground/80 hover:text-primary transition-colors">Comment ça marche</a>
+      <a href="/#prix" class="text-sm font-medium text-foreground/80 hover:text-primary transition-colors">Prix</a>
+      <a href="/#a-propos" class="text-sm font-medium text-foreground/80 hover:text-primary transition-colors">À propos</a>
+      <a href="/contact" class="text-sm font-medium text-foreground/80 hover:text-primary transition-colors">Contact</a>
+      <a href="#onboarding" class="inline-flex items-center justify-center px-5 py-2.5 text-sm font-semibold rounded-full bg-accent text-accent-foreground hover:bg-accent-hover transition-colors">
+        Commencer maintenant
+      </a>
+    </div>
+  </div>
+
+  <!-- Mobile menu -->
+  <div id="nav-mobile" class="hidden absolute top-16 left-0 right-0 bg-card border-b border-border p-4 flex-col gap-3 md:hidden shadow-lg">
+    <a href="/#comment-ca-marche" class="block py-2 text-sm font-medium text-foreground/80 hover:text-primary">Comment ça marche</a>
+    <a href="/#prix" class="block py-2 text-sm font-medium text-foreground/80 hover:text-primary">Prix</a>
+    <a href="/#a-propos" class="block py-2 text-sm font-medium text-foreground/80 hover:text-primary">À propos</a>
+    <a href="/contact" class="block py-2 text-sm font-medium text-foreground/80 hover:text-primary">Contact</a>
+    <a href="#onboarding" class="mt-2 inline-flex items-center justify-center px-5 py-2.5 text-sm font-semibold rounded-full bg-accent text-accent-foreground hover:bg-accent-hover transition-colors w-full">
+      Commencer maintenant
+    </a>
+  </div>
+</nav>
+
+<script>
+  const toggle = document.getElementById('nav-toggle');
+  const mobile = document.getElementById('nav-mobile');
+  if (toggle && mobile) {
+    toggle.addEventListener('click', () => {
+      const open = mobile.classList.toggle('hidden');
+      if (!open) mobile.classList.add('flex');
+      else mobile.classList.remove('flex');
+      toggle.setAttribute('aria-expanded', String(!open));
+    });
+    mobile.querySelectorAll('a').forEach(a => {
+      a.addEventListener('click', () => {
+        mobile.classList.add('hidden');
+        mobile.classList.remove('flex');
+        toggle.setAttribute('aria-expanded', 'false');
+      });
+    });
+  }
+</script>

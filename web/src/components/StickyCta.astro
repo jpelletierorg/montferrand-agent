@@ -1,0 +1,23 @@
+---
+---
+
+<div id="sticky-bar" class="fixed bottom-0 left-0 right-0 z-40 md:hidden p-3 bg-gradient-to-t from-background via-background/95 to-transparent translate-y-full transition-transform duration-300">
+  <button id="sticky-demo-btn" class="w-full px-6 py-3.5 text-sm font-semibold rounded-full bg-accent text-accent-foreground hover:bg-accent-hover shadow-xl cursor-pointer">
+    Essayer la démo
+  </button>
+</div>
+
+<script>
+  const bar = document.getElementById('sticky-bar');
+  if (bar) {
+    let shown = false;
+    window.addEventListener('scroll', () => {
+      const shouldShow = window.scrollY > 300;
+      if (shouldShow !== shown) {
+        shown = shouldShow;
+        bar.classList.toggle('translate-y-full', !shown);
+        bar.classList.toggle('translate-y-0', shown);
+      }
+    }, { passive: true });
+  }
+</script>
