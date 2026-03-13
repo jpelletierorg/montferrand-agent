@@ -34,18 +34,27 @@ def assert_hex_string(value: str, expected_length: int) -> None:
 
 
 @pytest.fixture
-def isolated_tenant_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Point MONTFERRAND_TENANT_DIR to a temp dir and return it."""
-    monkeypatch.setenv("MONTFERRAND_TENANT_DIR", str(tmp_path))
+def isolated_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point MONTFERRAND_DATA_DIR to a temp dir and return it.
+
+    All subdirectories (tenants/, conversations/, calendars/) live under
+    this single root, matching the production layout.
+    """
+    monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(tmp_path))
     return tmp_path
 
 
 @pytest.fixture
-def isolated_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Point MONTFERRAND_DATA_DIR to a temp dir and return it."""
-    data_dir = tmp_path / "data"
-    monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(data_dir))
-    return data_dir
+def isolated_tenant_dir(isolated_data_dir: Path) -> Path:
+    """Return the tenants/ subdirectory under the isolated data dir.
+
+    Depends on ``isolated_data_dir`` so MONTFERRAND_DATA_DIR is already
+    set.  Creates the directory eagerly so tests that write files
+    directly into it don't fail.
+    """
+    d = isolated_data_dir / "tenants"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 @pytest.fixture
@@ -55,8 +64,8 @@ def sms_tenant(
 ) -> Path:
     """Create an SMS tenant and return the tenant dir.
 
-    Sets both MONTFERRAND_TENANT_DIR and MONTFERRAND_DATA_DIR, and
-    creates a tenant config for TWILIO_NUMBER with TEST_PROFILE.
+    Sets MONTFERRAND_DATA_DIR and creates a tenant config for
+    TWILIO_NUMBER with TEST_PROFILE.
     """
     save_tenant_profile(TWILIO_NUMBER, TEST_PROFILE)
     return isolated_tenant_dir

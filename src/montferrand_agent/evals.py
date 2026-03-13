@@ -17,6 +17,11 @@ import os
 import time
 from dataclasses import dataclass, field
 
+import logfire
+
+logfire.configure(send_to_logfire="if-token-present", console=False)
+logfire.instrument_pydantic_ai()
+
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_evals import Case, Dataset
@@ -24,6 +29,7 @@ from pydantic_evals.evaluators import (
     Evaluator,
     EvaluatorContext,
     EvaluationReason,
+    HasMatchingSpan,
     LLMJudge,
 )
 from pydantic_evals.reporting import EvaluationReport
@@ -37,6 +43,7 @@ from montferrand_agent.agent import (
     get_agent,
     get_model_name,
 )
+from montferrand_agent.calendar import reset_calendar
 from montferrand_agent.conversation import (
     ConversationError,
     new_conversation_id,
@@ -209,6 +216,8 @@ _EVAL_DISPLAY_NAMES: dict[str, str] = {
     "plain_language": "Plain Lang.",
     "NoSlowTurns": "Speed",
     "physically_observable": "Physical",
+    "UsedListEvents": "List Evts",
+    "UsedCreateEvent": "Create Evt",
 }
 
 
@@ -405,6 +414,7 @@ async def run_scenario(scenario: Scenario) -> ConversationResult:
         )
     finally:
         reset(conversation_id, _EVAL_TENANT_NUMBER)
+        reset_calendar(_EVAL_TENANT_NUMBER)
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +543,25 @@ def build_dataset() -> Dataset[Scenario, ConversationResult, None]:
     evaluators = [
         ConversationConverged(),
         NoSlowTurns(),
+        # Span-based: verify the agent used calendar tools
+        HasMatchingSpan(
+            query={
+                "and_": [
+                    {"name_equals": "running tool"},
+                    {"has_attributes": {"gen_ai.tool.name": "tool_list_events"}},
+                ]
+            },
+            evaluation_name="UsedListEvents",
+        ),
+        HasMatchingSpan(
+            query={
+                "and_": [
+                    {"name_equals": "running tool"},
+                    {"has_attributes": {"gen_ai.tool.name": "tool_create_event"}},
+                ]
+            },
+            evaluation_name="UsedCreateEvent",
+        ),
         *_build_judge_evaluators(),
     ]
 

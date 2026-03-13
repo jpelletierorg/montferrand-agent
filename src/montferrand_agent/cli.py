@@ -8,6 +8,7 @@ Provides subcommands:
     uv run montferrand onboard            — register a new tenant
     uv run montferrand tenant edit        — edit a tenant's prompt
     uv run montferrand tenant list        — list configured tenants
+    uv run montferrand calendar          — show booked events for a tenant
     uv run montferrand reset              — wipe conversation data for a tenant
 """
 
@@ -18,6 +19,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 from typing import NoReturn
 
@@ -549,6 +551,89 @@ def _reset_remote(host: str, twilio_number: str) -> None:
         )
     else:
         _fatal(f"Remote error {response.status_code}: {response.text}")
+
+
+# ---------------------------------------------------------------------------
+# calendar subcommand
+# ---------------------------------------------------------------------------
+
+
+@app.command("calendar")
+def calendar_cmd(
+    twilio_number: str | None = typer.Option(
+        None,
+        "--twilio-number",
+        "-n",
+        help="Tenant phone number (E.164). If omitted, select interactively.",
+    ),
+    from_date: str | None = typer.Option(
+        None,
+        "--from",
+        "-f",
+        help="Start date (ISO, e.g. 2026-03-16). Default: today.",
+    ),
+    to_date: str | None = typer.Option(
+        None,
+        "--to",
+        "-t",
+        help="End date (ISO, e.g. 2026-04-16). Default: 30 days from start.",
+    ),
+    show_uid: bool = typer.Option(
+        False,
+        "--show-uid",
+        help="Show the event UID column.",
+    ),
+) -> None:
+    """Show booked events for a tenant's calendar."""
+    from montferrand_agent.calendar import _read_all_events
+
+    if twilio_number is None:
+        twilio_number = _select_tenant_interactive()
+
+    # Default date range: today → today + 30 days
+    start = date.fromisoformat(from_date) if from_date else date.today()
+    end = date.fromisoformat(to_date) if to_date else start + timedelta(days=30)
+
+    all_events = _read_all_events(twilio_number)
+
+    # Filter by date range and sort by start time
+    events = [
+        ev
+        for ev in all_events
+        if ev["start"].date() <= end and ev["end"].date() >= start
+    ]
+    events.sort(key=lambda ev: ev["start"])
+
+    label = f"Calendar for {twilio_number} ({start} to {end})"
+
+    if not events:
+        console.print(f"[dim]No events found — {label}[/dim]")
+        return
+
+    table = Table(title=label, show_lines=False)
+    table.add_column("Date", style="bold")
+    table.add_column("Time")
+    table.add_column("Summary")
+    table.add_column("Description")
+    if show_uid:
+        table.add_column("UID", style="dim")
+
+    for ev in events:
+        desc = ev["description"]
+        if len(desc) > 60:
+            desc = desc[:57] + "..."
+
+        row = [
+            ev["start"].strftime("%Y-%m-%d"),
+            f"{ev['start'].strftime('%H:%M')} - {ev['end'].strftime('%H:%M')}",
+            ev["summary"],
+            desc,
+        ]
+        if show_uid:
+            row.append(ev["uid"][:12] + "...")
+        table.add_row(*row)
+
+    console.print(table)
 
 
 @app.command("reset")

@@ -226,11 +226,17 @@ class TestNdjsonPersistence:
         """Point NDJSON writes to a temp dir for all persistence tests."""
         monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(tmp_path))
 
-    def test_data_dir_default(self, monkeypatch: pytest.MonkeyPatch):
+    def test_missing_env_var_crashes(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("MONTFERRAND_DATA_DIR", raising=False)
+        with pytest.raises(RuntimeError, match="MONTFERRAND_DATA_DIR"):
+            _data_dir()
+
+    def test_data_dir_returns_conversations_subdir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(tmp_path))
         directory = _data_dir()
-        assert directory.name == "conversations"
-        assert directory.parent.name == "data"
+        assert directory == tmp_path / "conversations"
 
     def test_load_from_empty_dir(self):
         assert _load_history_from_disk("nonexistent", _TN) == []

@@ -38,12 +38,12 @@ from pydantic_ai.usage import RunUsage
 logger = logging.getLogger(__name__)
 
 from montferrand_agent.agent import (
-    PROJECT_ROOT,
-    dir_from_env,
+    AgentDeps,
     get_agent,
     get_fallback_pricing,
     render_prompt,
 )
+from montferrand_agent.config import conversations_dir
 from montferrand_agent.models import Dialog, Report
 from montferrand_agent.tenant import phone_to_filename
 
@@ -62,8 +62,6 @@ class ConversationError(RuntimeError):
 # initial deployment but WILL need revisiting.
 # ---------------------------------------------------------------------------
 
-_DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "conversations"
-
 _ModelMessageAdapter = pydantic.TypeAdapter(
     ModelMessage,
     config=pydantic.ConfigDict(ser_json_bytes="base64", val_json_bytes="base64"),
@@ -72,7 +70,7 @@ _ModelMessageAdapter = pydantic.TypeAdapter(
 
 def _data_dir() -> Path:
     """Return the directory for conversation NDJSON files."""
-    return dir_from_env("MONTFERRAND_DATA_DIR", _DEFAULT_DATA_DIR)
+    return conversations_dir()
 
 
 def _tenant_data_dir(twilio_number: str) -> Path:
@@ -220,13 +218,16 @@ def reset(conversation_id: str, twilio_number: str) -> None:
 
 
 def reset_tenant(twilio_number: str) -> int:
-    """Delete all conversation data for a tenant.
+    """Delete all conversation data and calendar events for a tenant.
 
     Removes the tenant's conversation subdirectory and all NDJSON files
-    in it.  Also clears any matching in-memory state.
+    in it, plus the tenant's calendar vdir.  Also clears any matching
+    in-memory state.
 
     Returns the number of conversation files deleted.
     """
+    from montferrand_agent.calendar import reset_calendar
+
     tenant_dir = _tenant_data_dir(twilio_number)
 
     # Count files before deletion
@@ -245,6 +246,9 @@ def reset_tenant(twilio_number: str) -> int:
 
         # Remove the entire directory
         shutil.rmtree(tenant_dir)
+
+    # Wipe the tenant's calendar
+    reset_calendar(twilio_number)
 
     return count
 
@@ -354,6 +358,7 @@ async def _run_booking_agent(
     prompt: str | list[UserContent],
     history: list[ModelMessage],
     instructions: str,
+    twilio_number: str,
 ):
     """Run the booking agent with the assembled system prompt."""
     try:
@@ -361,6 +366,7 @@ async def _run_booking_agent(
             prompt,
             message_history=history,
             instructions=instructions,
+            deps=AgentDeps(twilio_number=twilio_number),
         )
     except Exception as exc:
         raise ConversationError(f"Agent call failed: {exc}") from exc
@@ -391,7 +397,7 @@ async def process_message(
         prompt = _build_prompt(text, images)
 
         instructions = render_prompt(tenant_profile)
-        result = await _run_booking_agent(prompt, history, instructions)
+        result = await _run_booking_agent(prompt, history, instructions, twilio_number)
 
         all_messages = result.all_messages()
         _save_history(conversation_id, all_messages, prev_msg_count, twilio_number)

@@ -35,14 +35,14 @@ class TestPhoneToFilename:
 
 
 class TestTenantDir:
-    def test_default_is_config_tenants(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("MONTFERRAND_TENANT_DIR", raising=False)
-        directory = tenant_dir()
-        assert directory.name == "tenants"
-        assert directory.parent.name == "config"
+    def test_missing_env_var_crashes(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("MONTFERRAND_DATA_DIR", raising=False)
+        with pytest.raises(RuntimeError, match="MONTFERRAND_DATA_DIR"):
+            tenant_dir()
 
-    def test_env_override(self, isolated_tenant_dir: Path):
-        assert tenant_dir() == isolated_tenant_dir
+    def test_returns_tenants_subdir(self, isolated_data_dir: Path):
+        directory = tenant_dir()
+        assert directory == isolated_data_dir / "tenants"
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ class TestSaveLoadRoundtrip:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ):
         nested = tmp_path / "a" / "b"
-        monkeypatch.setenv("MONTFERRAND_TENANT_DIR", str(nested))
+        monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(nested))
         path = save_tenant_profile(TENANT_PHONE, "profile")
         assert path.exists()
 
@@ -119,7 +119,7 @@ class TestListTenants:
         assert list_tenants() == []
 
     def test_nonexistent_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-        monkeypatch.setenv("MONTFERRAND_TENANT_DIR", str(tmp_path / "nope"))
+        monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(tmp_path / "nope"))
         assert list_tenants() == []
 
     def test_lists_saved_tenants(self, isolated_tenant_dir: Path):

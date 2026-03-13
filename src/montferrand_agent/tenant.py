@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from montferrand_agent.agent import PROJECT_ROOT, dir_from_env
+from montferrand_agent.config import tenants_dir
 
 
 class TenantNotFoundError(RuntimeError):
@@ -32,16 +32,10 @@ class TenantNotFoundError(RuntimeError):
 # Directory resolution
 # ---------------------------------------------------------------------------
 
-_DEFAULT_TENANT_DIR = PROJECT_ROOT / "config" / "tenants"
-
 
 def tenant_dir() -> Path:
-    """Return the directory where tenant config files are stored.
-
-    Reads ``MONTFERRAND_TENANT_DIR`` from the environment, falling back
-    to ``config/tenants/`` relative to the project root.
-    """
-    return dir_from_env("MONTFERRAND_TENANT_DIR", _DEFAULT_TENANT_DIR)
+    """Return the directory where tenant config files are stored."""
+    return tenants_dir()
 
 
 # ---------------------------------------------------------------------------

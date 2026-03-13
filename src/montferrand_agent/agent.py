@@ -18,32 +18,48 @@ variables (see .env.template).
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
-from pathlib import Path
 from typing import Union
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 
+from montferrand_agent import calendar as cal
 from montferrand_agent.models import Dialog, Report
 
 AgentOutput = Union[Dialog, Report]
+
+
+# ---------------------------------------------------------------------------
+# Agent dependencies — injected at runtime, not visible to the LLM
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentDeps:
+    """Runtime context for the agent.
+
+    ``twilio_number`` identifies the tenant and determines which
+    calendar the agent reads/writes.  The agent never sees this
+    value directly — it is used by the tool implementations to
+    scope operations to the correct tenant.
+    """
+
+    twilio_number: str
+
 
 # ---------------------------------------------------------------------------
 # Load .env file (searches from cwd upward)
 # ---------------------------------------------------------------------------
 
 load_dotenv()
-
-# PROJECT_ROOT is used only as a fallback for default config/data dirs.
-# In containerized deployments, always set MONTFERRAND_TENANT_DIR and
-# MONTFERRAND_DATA_DIR explicitly (the resolved path below will be wrong
-# when the package is installed as a wheel).
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -60,6 +76,8 @@ DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # ---------------------------------------------------------------------------
 
 MASTER_PROMPT_TEMPLATE = """\
+TODAY'S DATE: {current_date}
+
 IDENTITY:
 - You are a booking assistant for a residential plumbing company in Quebec.
 - In your first reply, briefly greet the customer and move on.
@@ -198,8 +216,17 @@ def render_prompt(tenant_profile: str) -> str:
     This is the single place where template + profile are combined.
     All callers must provide a tenant profile explicitly — there is no
     silent fallback.
+
+    Injects today's date (America/Montreal timezone) so the agent can
+    reason about "tomorrow", "next week", etc.
     """
-    return MASTER_PROMPT_TEMPLATE.replace("{tenant_profile}", tenant_profile)
+    _TZ = ZoneInfo("America/Montreal")
+    today = datetime.now(_TZ)
+    current_date = today.strftime("%Y-%m-%d %A")
+
+    return MASTER_PROMPT_TEMPLATE.replace("{tenant_profile}", tenant_profile).replace(
+        "{current_date}", current_date
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -222,18 +249,6 @@ def _require_env(env_var: str, message: str) -> str:
     if not value:
         raise RuntimeError(message)
     return value
-
-
-def dir_from_env(env_var: str, default: Path) -> Path:
-    """Return a directory from an env var override, or *default*.
-
-    This is the shared pattern used by ``tenant.py`` and ``conversation.py``
-    to resolve configurable directory paths.
-    """
-    override = os.getenv(env_var, "").strip()
-    if override:
-        return Path(override)
-    return default
 
 
 def _resolve_model_name(*env_names: str, model_name: str | None = None) -> str:
@@ -300,13 +315,111 @@ def build_judge_model() -> OpenAIChatModel:
 
 
 # ---------------------------------------------------------------------------
+# Tool functions — each receives RunContext[AgentDeps] so the tenant's
+# calendar is automatically scoped.  The LLM never sees twilio_number.
+# ---------------------------------------------------------------------------
+
+
+def tool_list_events(ctx: RunContext[AgentDeps], from_date: str, to_date: str) -> str:
+    """List all booked service calls in a date range.
+
+    You MUST call this tool BEFORE proposing any time slot to the customer.
+    Do not guess availability — always check the calendar first.
+
+    Returns a JSON array of booked events, or a message if none are found.
+
+    Args:
+        from_date: Start date in ISO format, e.g. '2026-03-16'.
+        to_date: End date in ISO format, e.g. '2026-03-20'.
+    """
+    return cal.list_events(ctx.deps.twilio_number, from_date, to_date)
+
+
+def tool_create_event(
+    ctx: RunContext[AgentDeps],
+    date: str,
+    start_time: str,
+    end_time: str,
+    summary: str,
+    description: str,
+) -> str:
+    """Book a new service call on the calendar.
+
+    You MUST call this tool when the customer confirms a time slot,
+    BEFORE returning a Report.  A booking is not valid unless this tool
+    returns BOOKED.  You MUST NOT finalize a booking (return a Report)
+    without a successful BOOKED confirmation from this tool.
+
+    If this tool returns CONFLICT, the slot is already taken — inform the
+    customer and propose an alternative time.
+
+    Returns 'BOOKED: ...' on success or 'CONFLICT: ...' if the slot overlaps.
+
+    Args:
+        date: Date in ISO format, e.g. '2026-03-16'.
+        start_time: Start time in HH:MM format, e.g. '09:00'.
+        end_time: End time in HH:MM format, e.g. '12:00'.
+        summary: Short label for the service call, e.g. 'Fuite sous evier - Jean Tremblay'.
+        description: Detailed description of the plumbing issue.
+    """
+    return cal.create_event(
+        ctx.deps.twilio_number, date, start_time, end_time, summary, description
+    )
+
+
+def tool_delete_event(ctx: RunContext[AgentDeps], uid: str) -> str:
+    """Cancel a booked service call.
+
+    Use this when the customer needs to cancel an existing appointment.
+    Call list_events first to find the UID of the event to cancel.
+
+    Returns 'DELETED: ...' on success or 'ERROR: ...' if no event matches the UID.
+
+    Args:
+        uid: The unique identifier of the event to cancel.
+    """
+    return cal.delete_event(ctx.deps.twilio_number, uid)
+
+
+def tool_modify_event(
+    ctx: RunContext[AgentDeps],
+    uid: str,
+    date: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    summary: str | None = None,
+    description: str | None = None,
+) -> str:
+    """Reschedule or update a booked service call.
+
+    Use this when the customer needs to change the date, time, or details
+    of an existing appointment.  Call list_events first to find the UID.
+    Only non-null fields are updated; the rest keep their current values.
+
+    Returns 'UPDATED: ...' on success, 'CONFLICT: ...' if the new time
+    overlaps another booking, or 'ERROR: ...' if no event matches the UID.
+
+    Args:
+        uid: The unique identifier of the event to modify.
+        date: New date in ISO format, or null to keep current.
+        start_time: New start time in HH:MM, or null to keep current.
+        end_time: New end time in HH:MM, or null to keep current.
+        summary: New summary, or null to keep current.
+        description: New description, or null to keep current.
+    """
+    return cal.modify_event(
+        ctx.deps.twilio_number, uid, date, start_time, end_time, summary, description
+    )
+
+
+# ---------------------------------------------------------------------------
 # Agent construction
 # ---------------------------------------------------------------------------
 
 
 def build_agent(
     model: OpenAIChatModel | None = None,
-) -> Agent[None, AgentOutput]:
+) -> Agent[AgentDeps, AgentOutput]:
     """Create a fresh booking agent with no static instructions.
 
     The tenant-specific system prompt is passed at run time via the
@@ -315,12 +428,19 @@ def build_agent(
     return Agent(
         name="montferrand_agent",
         model=model or build_model(),
+        deps_type=AgentDeps,
         output_type=AgentOutput,  # type: ignore[arg-type]
+        tools=[
+            tool_list_events,
+            tool_create_event,
+            tool_delete_event,
+            tool_modify_event,
+        ],
     )
 
 
 @lru_cache(maxsize=1)
-def get_agent() -> Agent[None, AgentOutput]:
+def get_agent() -> Agent[AgentDeps, AgentOutput]:
     """Return a cached singleton agent (the agent is stateless)."""
     return build_agent()
 
