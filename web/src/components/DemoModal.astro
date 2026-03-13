@@ -10,24 +10,24 @@
   <div id="demo-dialog" class="relative z-10 bg-card rounded-xl shadow-2xl p-6 md:p-8 max-w-md w-full opacity-0 scale-95 transition-all duration-300">
     <button id="demo-close" class="absolute top-3 right-4 text-2xl text-muted-foreground hover:text-foreground leading-none cursor-pointer" aria-label="Fermer">&times;</button>
 
-    <h3 id="demo-modal-title" class="font-serif text-xl font-bold text-primary">Essayer la démo</h3>
+    <h3 id="demo-modal-title" class="font-serif text-xl font-bold text-primary">Essayez notre démo</h3>
 
-    <div class="mt-4 space-y-3 text-sm text-foreground/90">
-      <p>Ceci est un <strong>environnement de démonstration</strong>.</p>
-      <p>Les prix, les heures et les disponibilités sont <strong>fictifs</strong>. Le but est de vous montrer exactement comment vos clients vont interagir avec le système.</p>
-      <p>Vous pouvez aussi <strong>demander une installation</strong> directement dans la conversation.</p>
+    <div class="mt-4 space-y-3 text-sm text-foreground/90 leading-relaxed">
+      <p>Textez notre numéro de démo comme si vous étiez un client. Montferrand va vous répondre exactement comme il répondrait à vos vrais clients.</p>
+      <p>Les prix et disponibilités sont <strong>fictifs</strong> — c'est juste pour vous montrer l'expérience.</p>
+      <p class="text-xs text-muted-foreground">En acceptant, vous nous autorisez à vous envoyer des SMS en lien avec cette offre de service.</p>
     </div>
 
     <label class="mt-6 flex items-center gap-3 cursor-pointer">
       <input type="checkbox" id="demo-ack" class="w-5 h-5 accent-secondary rounded cursor-pointer" />
-      <span class="text-sm font-medium">J'ai compris, montrez-moi le numéro</span>
+      <span class="text-sm font-medium">J'accepte, montrez-moi le numéro</span>
     </label>
 
     <!-- Number reveal -->
     <div id="demo-reveal" class="hidden mt-6 pt-6 border-t border-border text-center animate-[message-pop_0.3s_ease_forwards]">
       <p class="text-xs text-muted-foreground uppercase tracking-wider font-medium">Numéro de démo</p>
-      <a href="tel:5145550199" class="block mt-1 font-serif text-2xl font-bold text-primary no-underline">514-555-0199</a>
-      <a href="sms:5145550199" class="mt-4 inline-flex items-center justify-center w-full px-6 py-3 text-sm font-semibold rounded-full bg-accent text-accent-foreground hover:bg-accent-hover transition-colors">
+      <a href="tel:+14509125749" class="block mt-1 font-serif text-2xl font-bold text-primary no-underline">(450) 912-5749</a>
+      <a href="sms:+14509125749" class="mt-4 inline-flex items-center justify-center w-full px-6 py-3 text-sm font-semibold rounded-full bg-accent text-accent-foreground hover:bg-accent-hover transition-colors">
         Texter maintenant
       </a>
     </div>
@@ -72,8 +72,6 @@
   document.querySelectorAll('[id$="-demo-trigger"], [id$="-cta-trigger"]').forEach(el => {
     el.addEventListener('click', openModal);
   });
-  // Also sticky
-  document.getElementById('sticky-demo-btn')?.addEventListener('click', openModal);
 
   closeBtn?.addEventListener('click', closeModal);
   backdrop?.addEventListener('click', closeModal);
