@@ -1,51 +1,188 @@
 ---
 ---
 
-<section id="comment-ca-marche" class="py-20 md:py-28">
+<section id="comment-ca-marche" class="py-20 md:py-28 bg-primary">
   <div class="mx-auto max-w-6xl px-4 md:px-8">
-    <h2 class="font-serif text-3xl md:text-4xl font-bold text-primary text-center tracking-tight">
-      Comment ça marche
+
+    <!-- Section header -->
+    <p class="text-accent font-bold text-sm uppercase tracking-widest text-center">Comment ça marche</p>
+    <h2 class="mt-3 font-serif text-3xl md:text-4xl lg:text-5xl font-bold text-white text-center tracking-tight leading-tight max-w-3xl mx-auto">
+      Déléguez l'admin.<br class="hidden sm:block" /> Concentrez-vous sur la job.
     </h2>
-    <p class="mt-3 text-center text-muted-foreground max-w-lg mx-auto">
-      Un processus simple et transparent pour vous et vos clients.
+    <p class="mt-4 text-center text-white/50 max-w-xl mx-auto text-sm md:text-base leading-relaxed">
+      Votre agent SMS gère vos clients et vos rendez-vous. Vous, vous faites de la plomberie.
     </p>
 
-    <div class="mt-16 grid grid-cols-1 md:grid-cols-3 gap-12 md:gap-8 relative">
-      <!-- Connecting line (desktop only) -->
-      <div class="hidden md:block absolute top-12 left-[16.67%] right-[16.67%] h-px bg-border"></div>
+    <!-- ═══ Row 1: Van (left) + Steps 1–2 (right) ═══ -->
+    <div class="mt-16 flex flex-col lg:flex-row items-center gap-10 lg:gap-16">
 
-      <!-- Step 1 -->
-      <div class="flex flex-col items-center text-center">
-        <div class="relative z-10 w-24 h-24 rounded-full bg-blue-50 flex items-center justify-center shadow-sm border border-blue-100">
-          <span class="font-serif text-3xl font-bold text-secondary">1</span>
-        </div>
-        <h3 class="mt-5 font-serif text-xl font-bold text-primary">Votre client texte</h3>
-        <p class="mt-2 text-sm text-muted-foreground max-w-xs leading-relaxed">
-          Au lieu de laisser un message vocal dans le vide, le client décrit son problème par SMS au numéro de votre entreprise.
-        </p>
+      <!-- Van illustration -->
+      <div class="lg:w-[45%] w-full flex justify-center">
+        <img
+          src="/assets/mascot-tailgate.png"
+          alt="Jos Montferrand texte son agent depuis son camion"
+          class="w-[320px] md:w-[440px] h-auto drop-shadow-lg"
+          width="1200"
+          height="896"
+          loading="lazy"
+        />
       </div>
 
-      <!-- Step 2 -->
-      <div class="flex flex-col items-center text-center">
-        <div class="relative z-10 w-24 h-24 rounded-full bg-blue-50 flex items-center justify-center shadow-sm border border-blue-100">
-          <span class="font-serif text-3xl font-bold text-secondary">2</span>
+      <!-- Steps 1 & 2 -->
+      <div class="lg:w-[55%] w-full space-y-10 md:space-y-12">
+
+        <!-- Step 1 -->
+        <div class="flex gap-4 md:gap-5">
+          <div class="flex flex-col items-center shrink-0">
+            <div class="w-12 h-12 md:w-14 md:h-14 rounded-xl bg-white/10 flex items-center justify-center overflow-hidden">
+              <img src="/assets/icon-megaphone.png" alt="" class="w-8 h-8 md:w-10 md:h-10 object-contain" loading="lazy" />
+            </div>
+            <div class="w-px flex-1 bg-white/10 mt-3"></div>
+          </div>
+          <div class="pb-2">
+            <p class="text-accent text-xs font-bold uppercase tracking-wider mb-1">Étape 1</p>
+            <h3 class="font-serif text-lg md:text-xl font-bold text-white">
+              Publicisez votre numéro Montferrand
+            </h3>
+            <p class="mt-2 text-sm md:text-base text-white/50 leading-relaxed max-w-md">
+              On vous assigne un numéro SMS dédié. Affichez-le sur votre camion, votre site web, Google — partout où vos clients vous cherchent.
+            </p>
+          </div>
         </div>
-        <h3 class="mt-5 font-serif text-xl font-bold text-primary">Montferrand qualifie</h3>
-        <p class="mt-2 text-sm text-muted-foreground max-w-xs leading-relaxed">
-          Le système interagit, pose des questions diagnostiques de base et collecte le nom, l'adresse et les détails.
-        </p>
+
+        <!-- Step 2 -->
+        <div class="flex gap-4 md:gap-5">
+          <div class="flex flex-col items-center shrink-0">
+            <div class="w-12 h-12 md:w-14 md:h-14 rounded-xl bg-white/10 flex items-center justify-center overflow-hidden">
+              <img src="/assets/icon-calendar-check.png" alt="" class="w-8 h-8 md:w-10 md:h-10 object-contain" loading="lazy" />
+            </div>
+          </div>
+          <div>
+            <p class="text-accent text-xs font-bold uppercase tracking-wider mb-1">Étape 2</p>
+            <h3 class="font-serif text-lg md:text-xl font-bold text-white">
+              Montferrand prend vos rendez-vous
+            </h3>
+            <p class="mt-2 text-sm md:text-base text-white/50 leading-relaxed max-w-md">
+              Un client vous texte? Montferrand comprend le problème, pose les bonnes questions, propose un créneau et confirme le rendez-vous dans votre calendrier. Automatiquement.
+            </p>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Divider -->
+    <div class="border-t border-white/10 my-12 lg:my-16"></div>
+
+    <!-- ═══ Row 2: Steps 3–4 (left) + Phone mockup (right) ═══ -->
+    <div class="flex flex-col lg:flex-row items-center gap-10 lg:gap-16">
+
+      <!-- Steps 3 & 4 -->
+      <div class="lg:w-[55%] w-full space-y-10 md:space-y-12">
+
+        <!-- Step 3 -->
+        <div class="flex gap-4 md:gap-5">
+          <div class="flex flex-col items-center shrink-0">
+            <div class="w-12 h-12 md:w-14 md:h-14 rounded-xl bg-white/10 flex items-center justify-center overflow-hidden">
+              <img src="/assets/icon-control.png" alt="" class="w-8 h-8 md:w-10 md:h-10 object-contain" loading="lazy" />
+            </div>
+            <div class="w-px flex-1 bg-white/10 mt-3"></div>
+          </div>
+          <div class="pb-2">
+            <p class="text-accent text-xs font-bold uppercase tracking-wider mb-1">Étape 3</p>
+            <h3 class="font-serif text-lg md:text-xl font-bold text-white">
+              Gardez le contrôle par texto
+            </h3>
+            <p class="mt-2 text-sm md:text-base text-white/50 leading-relaxed max-w-md">
+              Bloquez une journée, avisez un client d'un retard, demandez quels outils apporter au prochain appel — textez Montferrand comme vous texteriez un employé. Il sait que vous êtes le patron.
+            </p>
+          </div>
+        </div>
+
+        <!-- Step 4 -->
+        <div class="flex gap-4 md:gap-5">
+          <div class="flex flex-col items-center shrink-0">
+            <div class="w-12 h-12 md:w-14 md:h-14 rounded-xl bg-white/10 flex items-center justify-center overflow-hidden">
+              <img src="/assets/icon-briefing.png" alt="" class="w-8 h-8 md:w-10 md:h-10 object-contain" loading="lazy" />
+            </div>
+          </div>
+          <div>
+            <p class="text-accent text-xs font-bold uppercase tracking-wider mb-1">Étape 4</p>
+            <h3 class="font-serif text-lg md:text-xl font-bold text-white">
+              Partez préparé chaque matin
+            </h3>
+            <p class="mt-2 text-sm md:text-base text-white/50 leading-relaxed max-w-md">
+              Demandez votre compte rendu quotidien par texto. Montferrand vous envoie la liste de vos rendez-vous avec l'adresse, le problème et ce qu'il faut apporter. Prêt à partir.
+            </p>
+          </div>
+        </div>
+
       </div>
 
-      <!-- Step 3 -->
-      <div class="flex flex-col items-center text-center">
-        <div class="relative z-10 w-24 h-24 rounded-full bg-blue-50 flex items-center justify-center shadow-sm border border-blue-100">
-          <span class="font-serif text-3xl font-bold text-secondary">3</span>
+      <!-- Phone mockup -->
+      <div class="lg:w-[45%] w-full flex justify-center">
+        <div class="w-[260px] md:w-[280px] rotate-1">
+          <div class="bg-gray-900 rounded-[32px] p-[7px] shadow-2xl border border-gray-700">
+            <!-- Screen -->
+            <div class="bg-white rounded-[25px] overflow-hidden relative">
+              <!-- Dynamic Island -->
+              <div class="absolute top-2 left-1/2 -translate-x-1/2 w-16 h-5 bg-black rounded-full z-10"></div>
+              <!-- Status bar -->
+              <div class="bg-gray-100 px-3.5 pt-8 pb-2 flex items-center justify-between">
+                <span class="text-[10px] font-bold text-gray-500">9:41</span>
+                <span class="text-[10px] font-semibold text-gray-700">Montferrand</span>
+                <div class="flex gap-0.5">
+                  <div class="w-3 h-3 bg-gray-400 rounded-full"></div>
+                </div>
+              </div>
+              <!-- Messages -->
+              <div class="px-3 py-3.5 space-y-3">
+                <!-- Plumber: block Friday -->
+                <div class="flex justify-end">
+                  <div class="bg-[#007AFF] text-white rounded-[18px] rounded-br-[4px] px-3.5 py-2.5 max-w-[85%]">
+                    <p class="text-[12px] leading-snug">Bloque ma journée de vendredi.</p>
+                  </div>
+                </div>
+                <!-- Agent: confirms -->
+                <div class="flex justify-start">
+                  <div class="bg-[#E9E9EB] text-gray-900 rounded-[18px] rounded-bl-[4px] px-3.5 py-2.5 max-w-[90%]">
+                    <p class="text-[12px] leading-snug">C'est fait. 3 clients avisés, tous replacés la semaine prochaine.</p>
+                  </div>
+                </div>
+                <!-- Plumber: ask for Monday schedule -->
+                <div class="flex justify-end">
+                  <div class="bg-[#007AFF] text-white rounded-[18px] rounded-br-[4px] px-3.5 py-2.5 max-w-[85%]">
+                    <p class="text-[12px] leading-snug">Envoie-moi mon horaire de lundi.</p>
+                  </div>
+                </div>
+                <!-- Agent: Monday briefing -->
+                <div class="flex justify-start">
+                  <div class="bg-[#E9E9EB] text-gray-900 rounded-[18px] rounded-bl-[4px] px-3.5 py-2.5 max-w-[90%]">
+                    <p class="text-[12px] leading-snug">Lundi 17 mars — 3 appels:<br/>8h Laval (chauffe-eau)<br/>10h30 Longueuil (robinet)<br/>14h Brossard (drain)</p>
+                  </div>
+                </div>
+              </div>
+              <!-- Input bar -->
+              <div class="border-t border-gray-200 px-3 py-2.5 flex items-center gap-2">
+                <div class="flex-1 bg-gray-100 rounded-full px-3.5 py-2">
+                  <span class="text-[10px] text-gray-400">iMessage</span>
+                </div>
+                <div class="w-6 h-6 bg-[#007AFF] rounded-full flex items-center justify-center">
+                  <svg class="w-3 h-3 text-white" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
-        <h3 class="mt-5 font-serif text-xl font-bold text-primary">Vous recevez le résumé</h3>
-        <p class="mt-2 text-sm text-muted-foreground max-w-xs leading-relaxed">
-          À votre réveil, vous avez un résumé propre de l'intervention directement par texto, courriel ou Google Calendar.
-        </p>
       </div>
+
+    </div>
+
+    <!-- CTA -->
+    <div class="mt-14 text-center">
+      <a href="#onboarding" class="inline-flex items-center justify-center px-8 py-4 text-base font-semibold rounded-full bg-accent text-accent-foreground hover:bg-accent-hover transition-colors shadow-md">
+        Commencer maintenant &rarr;
+      </a>
     </div>
   </div>
 </section>

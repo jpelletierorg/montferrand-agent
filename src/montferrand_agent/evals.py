@@ -672,22 +672,32 @@ def _print_failure_details(
     report: EvaluationReport[Scenario, ConversationResult, None],
     eval_names: list[str],
 ) -> None:
-    """Print reasons for any failed assertions."""
-    has_failures = False
+    """Print a compact table of failed assertions with reasons."""
+    rows: list[tuple[str, str, str]] = []
     for case in report.cases:
-        failures = []
         for name in eval_names:
             assertion = case.assertions.get(name)
             if assertion and not assertion.value and assertion.reason:
-                failures.append((name, assertion.reason))
-        if failures:
-            if not has_failures:
-                console.print()
-                console.print("[bold]Failure details:[/bold]")
-                has_failures = True
-            console.print(f"  [bold]{case.name}:[/bold]")
-            for name, reason in failures:
-                console.print(f"    {_display_name(name)}: {reason}")
+                rows.append((case.name, _display_name(name), assertion.reason))
+
+    if not rows:
+        return
+
+    console.print()
+    table = Table(
+        title="Failures",
+        title_style="bold",
+        show_lines=True,
+        padding=(0, 1),
+    )
+    table.add_column("Scenario", style="bold", no_wrap=True)
+    table.add_column("Eval", no_wrap=True)
+    table.add_column("Reason", max_width=80)
+
+    for scenario, eval_name, reason in rows:
+        table.add_row(scenario, eval_name, reason)
+
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------
