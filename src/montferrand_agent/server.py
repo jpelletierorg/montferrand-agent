@@ -42,8 +42,10 @@ from montferrand_agent.conversation import (
     reset_tenant,
 )
 from montferrand_agent.tenant import (
+    TenantConfig,
     TenantNotFoundError,
-    load_tenant_profile,
+    load_tenant_config,
+    save_tenant_config,
     save_tenant_profile,
 )
 
@@ -232,17 +234,23 @@ async def _handle_sms(
     from_number: str,
     body: str,
     tenant_profile: str,
+    *,
+    is_boss: bool = False,
 ) -> None:
     """Background task: process the message and send the reply via Twilio API.
 
     This runs after the webhook has already returned an empty TwiML to
-    Twilio.  Errors are logged and an error SMS is sent to the customer.
+    Twilio.  Errors are logged and an error SMS is sent to the sender.
     """
     key = conversation_key_for_sms(twilio_number, from_number)
 
     try:
         result = await process_message(
-            key, body, tenant_profile=tenant_profile, twilio_number=twilio_number
+            key,
+            body,
+            tenant_profile=tenant_profile,
+            twilio_number=twilio_number,
+            is_boss=is_boss,
         )
         reply = result.message
     except ConversationError as exc:
@@ -281,9 +289,9 @@ async def sms_webhook(request: Request) -> Response:
         logger.info("Duplicate MessageSid %s — skipping", message_sid)
         return _empty_twiml()
 
-    # Load tenant profile (sync and fast — can respond inline on error)
+    # Load tenant config (sync and fast — can respond inline on error)
     try:
-        tenant_profile = load_tenant_profile(twilio_number)
+        config = load_tenant_config(twilio_number)
     except TenantNotFoundError:
         logger.error("No tenant config for %s", twilio_number)
         return _twiml_response(
@@ -291,9 +299,17 @@ async def sms_webhook(request: Request) -> Response:
             "Veuillez contacter l'entreprise directement."
         )
 
+    boss = from_number in config.boss_numbers
+
     # Launch background task and return immediately
     task = asyncio.create_task(
-        _handle_sms(twilio_number, from_number, body, tenant_profile)
+        _handle_sms(
+            twilio_number,
+            from_number,
+            body,
+            config.profile,
+            is_boss=boss,
+        )
     )
     _track_task(task)
 
@@ -310,6 +326,7 @@ class TenantUpsertRequest(BaseModel):
 
     twilio_number: str
     tenant_profile: str
+    boss_numbers: list[str] = []
 
 
 @app.post(
@@ -318,8 +335,13 @@ class TenantUpsertRequest(BaseModel):
     dependencies=[Depends(_validate_admin_token)],
 )
 async def upsert_tenant(payload: TenantUpsertRequest) -> dict[str, str]:
-    """Create or update a tenant's profile."""
-    path = save_tenant_profile(payload.twilio_number, payload.tenant_profile)
+    """Create or update a tenant's configuration."""
+    config = TenantConfig(
+        phone=payload.twilio_number,
+        profile=payload.tenant_profile,
+        boss_numbers=payload.boss_numbers,
+    )
+    path = save_tenant_config(config)
     logger.info("Tenant upserted: %s -> %s", payload.twilio_number, path)
     return {"status": "ok", "path": str(path)}
 

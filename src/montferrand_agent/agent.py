@@ -204,29 +204,65 @@ DEMO_TENANT_PROFILE = """\
     believe such a job takes in the field.
     """
 
+# ---------------------------------------------------------------------------
+# Boss prompt template — control plane for the business owner
+# ---------------------------------------------------------------------------
+
+BOSS_PROMPT_TEMPLATE = """\
+TODAY'S DATE: {current_date}
+
+IDENTITY:
+- You are the business assistant for a plumbing company. You are talking to the business owner (the boss), not a customer.
+- Be direct, terse, and operational. No small talk.
+
+YOUR GOAL:
+- Help the boss manage their schedule and business operations via SMS.
+- Answer questions about upcoming appointments, customer details, and availability.
+- Execute schedule changes: block days off, cancel appointments, reschedule bookings.
+
+LANGUAGE RULES:
+- Your default language is French. If the boss writes in English, switch to English.
+- Never mix languages within a single message.
+
+COMPANY INFORMATION:
+{tenant_profile}
+
+CAPABILITIES:
+- Use the calendar tools to look up, create, modify, or delete appointments.
+- When the boss asks about upcoming work, check the calendar and summarize what is booked.
+- When the boss wants to block time off, create an all-day event with a clear summary (e.g., "CONGE - pas de rendez-vous").
+- When the boss asks about a specific customer, search the calendar for matching events.
+- Keep responses short and factual. The boss does not need explanations — just the information."""
+
 
 # ---------------------------------------------------------------------------
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
+_TZ = ZoneInfo("America/Montreal")
 
-def render_prompt(tenant_profile: str) -> str:
-    """Assemble the final system prompt from the master template and a tenant profile.
 
-    This is the single place where template + profile are combined.
-    All callers must provide a tenant profile explicitly — there is no
-    silent fallback.
-
-    Injects today's date (America/Montreal timezone) so the agent can
-    reason about "tomorrow", "next week", etc.
-    """
-    _TZ = ZoneInfo("America/Montreal")
+def _inject_date(template: str, tenant_profile: str) -> str:
+    """Replace {tenant_profile} and {current_date} in a prompt template."""
     today = datetime.now(_TZ)
     current_date = today.strftime("%Y-%m-%d %A")
-
-    return MASTER_PROMPT_TEMPLATE.replace("{tenant_profile}", tenant_profile).replace(
+    return template.replace("{tenant_profile}", tenant_profile).replace(
         "{current_date}", current_date
     )
+
+
+def render_prompt(tenant_profile: str) -> str:
+    """Assemble the final customer-facing system prompt.
+
+    All callers must provide a tenant profile explicitly — there is no
+    silent fallback.
+    """
+    return _inject_date(MASTER_PROMPT_TEMPLATE, tenant_profile)
+
+
+def render_boss_prompt(tenant_profile: str) -> str:
+    """Assemble the boss/control-plane system prompt."""
+    return _inject_date(BOSS_PROMPT_TEMPLATE, tenant_profile)
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +477,37 @@ def build_agent(
 
 @lru_cache(maxsize=1)
 def get_agent() -> Agent[AgentDeps, AgentOutput]:
-    """Return a cached singleton agent (the agent is stateless)."""
+    """Return a cached singleton customer-facing agent (stateless)."""
     return build_agent()
+
+
+def build_boss_agent(
+    model: OpenAIChatModel | None = None,
+) -> Agent[AgentDeps, AgentOutput]:
+    """Create a fresh boss/control-plane agent.
+
+    Uses the same tools as the customer agent but a different prompt
+    template (``BOSS_PROMPT_TEMPLATE``).  The prompt is injected at
+    runtime via the ``instructions`` parameter.
+    """
+    return Agent(
+        name="montferrand_boss_agent",
+        model=model or build_model(),
+        deps_type=AgentDeps,
+        output_type=AgentOutput,  # type: ignore[arg-type]
+        tools=[
+            tool_list_events,
+            tool_create_event,
+            tool_delete_event,
+            tool_modify_event,
+        ],
+    )
+
+
+@lru_cache(maxsize=1)
+def get_boss_agent() -> Agent[AgentDeps, AgentOutput]:
+    """Return a cached singleton boss agent (stateless)."""
+    return build_boss_agent()
 
 
 def get_model_name() -> str:

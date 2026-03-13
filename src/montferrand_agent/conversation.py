@@ -40,7 +40,9 @@ logger = logging.getLogger(__name__)
 from montferrand_agent.agent import (
     AgentDeps,
     get_agent,
+    get_boss_agent,
     get_fallback_pricing,
+    render_boss_prompt,
     render_prompt,
 )
 from montferrand_agent.config import conversations_dir
@@ -354,15 +356,22 @@ def _update_cost(
     _costs[conversation_id] = cost
 
 
-async def _run_booking_agent(
+async def _run_agent(
     prompt: str | list[UserContent],
     history: list[ModelMessage],
     instructions: str,
     twilio_number: str,
+    *,
+    is_boss: bool = False,
 ):
-    """Run the booking agent with the assembled system prompt."""
+    """Run the appropriate agent with the assembled system prompt.
+
+    When *is_boss* is True, uses the boss agent and boss prompt.
+    Otherwise uses the customer-facing booking agent.
+    """
+    agent = get_boss_agent() if is_boss else get_agent()
     try:
-        return await get_agent().run(
+        return await agent.run(
             prompt,
             message_history=history,
             instructions=instructions,
@@ -379,14 +388,17 @@ async def process_message(
     *,
     tenant_profile: str,
     twilio_number: str,
+    is_boss: bool = False,
 ) -> Union[Dialog, Report]:
     """Run one turn of conversation and return Dialog or Report.
 
     The *tenant_profile* parameter carries the company-specific text that
-    is injected into the master prompt template.  The *twilio_number*
-    identifies which tenant's conversation subdirectory to use for
-    persistence.  Both parameters are required — there is no silent
-    fallback.
+    is injected into the prompt template.  The *twilio_number* identifies
+    which tenant's conversation subdirectory to use for persistence.
+    Both parameters are required — there is no silent fallback.
+
+    When *is_boss* is True, the boss agent and prompt are used instead
+    of the customer-facing ones.
 
     Raises:
         ConversationError: If the agent call fails.
@@ -396,8 +408,13 @@ async def process_message(
         prev_msg_count = len(history)
         prompt = _build_prompt(text, images)
 
-        instructions = render_prompt(tenant_profile)
-        result = await _run_booking_agent(prompt, history, instructions, twilio_number)
+        if is_boss:
+            instructions = render_boss_prompt(tenant_profile)
+        else:
+            instructions = render_prompt(tenant_profile)
+        result = await _run_agent(
+            prompt, history, instructions, twilio_number, is_boss=is_boss
+        )
 
         all_messages = result.all_messages()
         _save_history(conversation_id, all_messages, prev_msg_count, twilio_number)

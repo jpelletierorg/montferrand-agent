@@ -42,9 +42,12 @@ from montferrand_agent.conversation import (
 )
 from montferrand_agent.models import Report
 from montferrand_agent.tenant import (
+    TenantConfig,
     TenantNotFoundError,
     list_tenants,
+    load_tenant_config,
     load_tenant_profile,
+    save_tenant_config,
     save_tenant_profile,
 )
 
@@ -125,14 +128,26 @@ def _resolve_host(host: str | None, *, local: bool = False) -> str | None:
     return os.environ.get("MONTFERRAND_HOST", "").strip() or None
 
 
-def _push_to_remote(host: str, twilio_number: str, profile: str) -> None:
-    """POST a tenant profile to a remote Montferrand server."""
+def _push_to_remote(
+    host: str,
+    twilio_number: str,
+    profile: str,
+    boss_numbers: list[str] | None = None,
+) -> None:
+    """POST a tenant config to a remote Montferrand server."""
     token = _require_admin_token()
 
     url = f"https://{host}/admin/tenants"
+    payload: dict = {
+        "twilio_number": twilio_number,
+        "tenant_profile": profile,
+    }
+    if boss_numbers:
+        payload["boss_numbers"] = boss_numbers
+
     response = httpx.post(
         url,
-        json={"twilio_number": twilio_number, "tenant_profile": profile},
+        json=payload,
         headers={"Authorization": f"Bearer {token}"},
         timeout=30,
     )
@@ -375,6 +390,18 @@ def serve(
 # ---------------------------------------------------------------------------
 
 
+def _build_example_toml(twilio_number: str) -> str:
+    """Build an example TOML config for a new tenant."""
+    import tomli_w
+
+    data: dict = {
+        "phone": twilio_number,
+        "boss_numbers": [],
+        "profile": {"text": DEMO_TENANT_PROFILE.rstrip()},
+    }
+    return tomli_w.dumps(data)
+
+
 @app.command()
 def onboard(
     twilio_number: str = typer.Option(
@@ -388,6 +415,12 @@ def onboard(
         "--prompt-file",
         "-f",
         help="Read tenant profile from file instead of editor",
+    ),
+    boss_numbers: str | None = typer.Option(
+        None,
+        "--boss-numbers",
+        "-b",
+        help="Comma-separated list of boss phone numbers (E.164)",
     ),
     host: str | None = typer.Option(
         None,
@@ -404,21 +437,46 @@ def onboard(
     """Register a new tenant with a company profile."""
     remote = _resolve_host(host, local=local)
 
-    # Load profile from file or open editor with example
+    parsed_boss: list[str] = []
+    if boss_numbers:
+        parsed_boss = [n.strip() for n in boss_numbers.split(",") if n.strip()]
+
+    # Load profile from file or open editor with TOML template
     if prompt_file:
         if not prompt_file.exists():
             _fatal(f"File not found: {prompt_file}")
         profile = prompt_file.read_text(encoding="utf-8")
     else:
-        profile = _edit_text_in_editor(DEMO_TENANT_PROFILE)
-        if profile is None:
-            _fatal("Aborted — empty or unchanged profile.")
+        example_toml = _build_example_toml(twilio_number)
+        edited = _edit_text_in_editor(example_toml, suffix=".toml")
+        if edited is None:
+            _fatal("Aborted — empty or unchanged config.")
+
+        # Parse the TOML to extract profile and boss_numbers
+        import tomllib
+
+        try:
+            data = tomllib.loads(edited)
+        except Exception as exc:
+            _fatal(f"Invalid TOML: {exc}")
+        profile = data.get("profile", {}).get("text", "").strip()
+        if not profile:
+            _fatal("Aborted — empty profile text.")
+        # Boss numbers from TOML override the --boss-numbers flag
+        toml_boss = data.get("boss_numbers", [])
+        if toml_boss:
+            parsed_boss = toml_boss
 
     # Save locally or push to remote
     if remote:
-        _push_to_remote(remote, twilio_number, profile)
+        _push_to_remote(remote, twilio_number, profile, parsed_boss)
     else:
-        path = save_tenant_profile(twilio_number, profile)
+        config = TenantConfig(
+            phone=twilio_number,
+            profile=profile,
+            boss_numbers=parsed_boss,
+        )
+        path = save_tenant_config(config)
         console.print(f"[green]Tenant saved:[/green] {path}")
 
 
@@ -447,13 +505,16 @@ def tenant_edit(
         help="Read/write locally even if MONTFERRAND_HOST is set",
     ),
 ) -> None:
-    """Edit an existing tenant's profile."""
+    """Edit an existing tenant's configuration (TOML)."""
+    import tomllib
+
+    import tomli_w
+
     remote = _resolve_host(host, local=local)
 
-    # Load current profile
+    # Load current config as TOML
     if remote:
         token = _require_admin_token()
-        # Fetch current profile from remote
         url = f"https://{remote}/admin/tenants/{twilio_number}"
         response = httpx.get(
             url,
@@ -463,22 +524,53 @@ def tenant_edit(
         if response.status_code != 200:
             _fatal(f"Could not fetch tenant: {response.status_code}")
         current_profile = response.json().get("tenant_profile", "")
+        # Build a TOML representation for editing
+        current_toml = tomli_w.dumps(
+            {
+                "phone": twilio_number,
+                "boss_numbers": response.json().get("boss_numbers", []),
+                "profile": {"text": current_profile},
+            }
+        )
     else:
         try:
-            current_profile = load_tenant_profile(twilio_number)
+            config = load_tenant_config(twilio_number)
         except TenantNotFoundError:
             _fatal(f"No tenant found for {twilio_number}")
+        current_toml = tomli_w.dumps(
+            {
+                "phone": config.phone,
+                "boss_numbers": config.boss_numbers,
+                "profile": {"text": config.profile},
+            }
+        )
 
     # Open in editor
-    edited = _edit_text_in_editor(current_profile)
+    edited = _edit_text_in_editor(current_toml, suffix=".toml")
     if edited is None:
-        _fatal("Aborted — empty profile.")
+        _fatal("Aborted — empty config.")
+
+    # Parse edited TOML
+    try:
+        data = tomllib.loads(edited)
+    except Exception as exc:
+        _fatal(f"Invalid TOML: {exc}")
+
+    profile = data.get("profile", {}).get("text", "").strip()
+    if not profile:
+        _fatal("Aborted — empty profile text.")
+    boss_numbers = data.get("boss_numbers", [])
 
     # Save
     if remote:
-        _push_to_remote(remote, twilio_number, edited)
+        _push_to_remote(remote, twilio_number, profile, boss_numbers)
     else:
-        path = save_tenant_profile(twilio_number, edited)
+        new_config = TenantConfig(
+            phone=twilio_number,
+            profile=profile,
+            boss_numbers=boss_numbers,
+        )
+        path = save_tenant_config(new_config)
         console.print(f"[green]Tenant updated:[/green] {path}")
 
 
@@ -492,10 +584,17 @@ def tenant_list() -> None:
 
     table = Table(title="Configured Tenants", show_lines=False)
     table.add_column("Phone Number", style="bold")
+    table.add_column("Boss #s", justify="center")
     table.add_column("Config File", style="dim")
 
     for phone, path in tenants:
-        table.add_row(phone, str(path))
+        # Try to load boss_numbers count
+        try:
+            config = load_tenant_config(phone)
+            boss_count = str(len(config.boss_numbers))
+        except Exception:
+            boss_count = "-"
+        table.add_row(phone, boss_count, str(path))
 
     console.print(table)
 

@@ -5,10 +5,14 @@ from pathlib import Path
 import pytest
 
 from montferrand_agent.tenant import (
+    TenantConfig,
     TenantNotFoundError,
+    is_boss,
     list_tenants,
+    load_tenant_config,
     load_tenant_profile,
     phone_to_filename,
+    save_tenant_config,
     save_tenant_profile,
     tenant_dir,
 )
@@ -46,31 +50,46 @@ class TestTenantDir:
 
 
 # ---------------------------------------------------------------------------
-# save / load roundtrip
+# save / load roundtrip (TOML format)
 # ---------------------------------------------------------------------------
 
 
 class TestSaveLoadRoundtrip:
-    def test_save_creates_file(self, isolated_tenant_dir: Path):
-        path = save_tenant_profile(TENANT_PHONE, TEST_PROFILE)
+    def test_save_creates_toml_file(self, isolated_tenant_dir: Path):
+        config = TenantConfig(phone=TENANT_PHONE, profile=TEST_PROFILE)
+        path = save_tenant_config(config)
         assert path.exists()
-        assert path.suffix == ".txt"
+        assert path.suffix == ".toml"
 
     def test_save_creates_parent_dirs(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ):
         nested = tmp_path / "a" / "b"
         monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(nested))
-        path = save_tenant_profile(TENANT_PHONE, "profile")
+        config = TenantConfig(phone=TENANT_PHONE, profile="profile")
+        path = save_tenant_config(config)
         assert path.exists()
 
-    def test_load_returns_profile(self, isolated_tenant_dir: Path):
+    def test_load_returns_config(self, isolated_tenant_dir: Path):
+        config = TenantConfig(
+            phone=TENANT_PHONE,
+            profile=TEST_PROFILE,
+            boss_numbers=["+14381112222"],
+        )
+        save_tenant_config(config)
+
+        loaded = load_tenant_config(TENANT_PHONE)
+        assert loaded.phone == TENANT_PHONE
+        assert loaded.profile == TEST_PROFILE
+        assert loaded.boss_numbers == ["+14381112222"]
+
+    def test_load_profile_returns_text(self, isolated_tenant_dir: Path):
         save_tenant_profile(TENANT_PHONE, TEST_PROFILE)
         assert load_tenant_profile(TENANT_PHONE) == TEST_PROFILE
 
     def test_load_missing_raises(self, isolated_tenant_dir: Path):
         with pytest.raises(TenantNotFoundError):
-            load_tenant_profile("+10000000000")
+            load_tenant_config("+10000000000")
 
     def test_save_overwrites_existing(self, isolated_tenant_dir: Path):
         save_tenant_profile(TENANT_PHONE, "version 1")
@@ -82,31 +101,151 @@ class TestSaveLoadRoundtrip:
         save_tenant_profile(TENANT_PHONE, profile)
         assert load_tenant_profile(TENANT_PHONE) == profile
 
+    def test_save_profile_preserves_boss_numbers(self, isolated_tenant_dir: Path):
+        """save_tenant_profile() preserves existing boss_numbers."""
+        config = TenantConfig(
+            phone=TENANT_PHONE,
+            profile="v1",
+            boss_numbers=["+14381112222"],
+        )
+        save_tenant_config(config)
+
+        # Update profile via the convenience wrapper
+        save_tenant_profile(TENANT_PHONE, "v2")
+
+        loaded = load_tenant_config(TENANT_PHONE)
+        assert loaded.profile == "v2"
+        assert loaded.boss_numbers == ["+14381112222"]
+
+    def test_default_boss_numbers_empty(self, isolated_tenant_dir: Path):
+        save_tenant_profile(TENANT_PHONE, TEST_PROFILE)
+        loaded = load_tenant_config(TENANT_PHONE)
+        assert loaded.boss_numbers == []
+
 
 # ---------------------------------------------------------------------------
-# File format
+# TOML file format
 # ---------------------------------------------------------------------------
 
 
 class TestFileFormat:
-    def test_file_starts_with_comment(self, isolated_tenant_dir: Path):
-        path = save_tenant_profile(TENANT_PHONE, "profile")
-        content = path.read_text()
-        assert content.startswith(f"# {TENANT_PHONE}\n")
+    def test_file_is_valid_toml(self, isolated_tenant_dir: Path):
+        import tomllib
 
-    def test_load_strips_comment_header(self, isolated_tenant_dir: Path):
-        """Manually write a file with a comment and verify load strips it."""
+        config = TenantConfig(phone=TENANT_PHONE, profile="profile text")
+        path = save_tenant_config(config)
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        assert data["phone"] == TENANT_PHONE
+        assert data["profile"]["text"] == "profile text"
+
+    def test_boss_numbers_in_toml(self, isolated_tenant_dir: Path):
+        import tomllib
+
+        config = TenantConfig(
+            phone=TENANT_PHONE,
+            profile="profile",
+            boss_numbers=["+14381112222", "+14389876543"],
+        )
+        path = save_tenant_config(config)
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        assert data["boss_numbers"] == ["+14381112222", "+14389876543"]
+
+
+# ---------------------------------------------------------------------------
+# Legacy .txt fallback
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyTxtFallback:
+    def test_loads_legacy_txt(self, isolated_tenant_dir: Path):
+        """A legacy .txt file should load with empty boss_numbers."""
         path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.txt"
         path.write_text(f"# {TENANT_PHONE}\nThe actual profile.")
-        assert load_tenant_profile(TENANT_PHONE) == "The actual profile."
 
-    def test_load_file_without_comment_returns_full_text(
-        self, isolated_tenant_dir: Path
-    ):
-        """A file missing the # header returns its full content."""
+        config = load_tenant_config(TENANT_PHONE)
+        assert config.profile == "The actual profile."
+        assert config.boss_numbers == []
+
+    def test_legacy_without_comment_returns_full_text(self, isolated_tenant_dir: Path):
         path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.txt"
         path.write_text("No comment header here.")
-        assert load_tenant_profile(TENANT_PHONE) == "No comment header here."
+
+        config = load_tenant_config(TENANT_PHONE)
+        assert config.profile == "No comment header here."
+
+    def test_toml_takes_priority_over_txt(self, isolated_tenant_dir: Path):
+        """When both .toml and .txt exist, TOML wins."""
+        txt_path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.txt"
+        txt_path.write_text(f"# {TENANT_PHONE}\nfrom txt")
+
+        config = TenantConfig(phone=TENANT_PHONE, profile="from toml")
+        save_tenant_config(config)
+
+        loaded = load_tenant_config(TENANT_PHONE)
+        assert loaded.profile == "from toml"
+
+
+# ---------------------------------------------------------------------------
+# Empty / missing profile detection
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyProfile:
+    def test_empty_toml_profile_raises(self, isolated_tenant_dir: Path):
+        """A TOML file with empty profile text must crash."""
+        import tomli_w
+
+        path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.toml"
+        path.write_bytes(
+            tomli_w.dumps(
+                {"phone": TENANT_PHONE, "boss_numbers": [], "profile": {"text": ""}}
+            ).encode()
+        )
+        with pytest.raises(TenantNotFoundError, match="empty"):
+            load_tenant_config(TENANT_PHONE)
+
+    def test_legacy_comment_only_raises(self, isolated_tenant_dir: Path):
+        """A legacy .txt file with only a comment header."""
+        path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.txt"
+        path.write_text(f"# {TENANT_PHONE}\n")
+        with pytest.raises(TenantNotFoundError):
+            load_tenant_config(TENANT_PHONE)
+
+    def test_legacy_whitespace_only_raises(self, isolated_tenant_dir: Path):
+        """A legacy .txt file with only whitespace."""
+        path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.txt"
+        path.write_text("   \n  \n")
+        with pytest.raises(TenantNotFoundError):
+            load_tenant_config(TENANT_PHONE)
+
+
+# ---------------------------------------------------------------------------
+# is_boss
+# ---------------------------------------------------------------------------
+
+
+class TestIsBoss:
+    def test_boss_number_returns_true(self, isolated_tenant_dir: Path):
+        config = TenantConfig(
+            phone=TENANT_PHONE,
+            profile="profile",
+            boss_numbers=["+14381112222"],
+        )
+        save_tenant_config(config)
+        assert is_boss(TENANT_PHONE, "+14381112222") is True
+
+    def test_non_boss_returns_false(self, isolated_tenant_dir: Path):
+        config = TenantConfig(
+            phone=TENANT_PHONE,
+            profile="profile",
+            boss_numbers=["+14381112222"],
+        )
+        save_tenant_config(config)
+        assert is_boss(TENANT_PHONE, "+14389999999") is False
+
+    def test_no_boss_numbers_returns_false(self, isolated_tenant_dir: Path):
+        save_tenant_profile(TENANT_PHONE, "profile")
+        assert is_boss(TENANT_PHONE, "+14381112222") is False
 
 
 # ---------------------------------------------------------------------------
@@ -131,37 +270,10 @@ class TestListTenants:
         assert "+15145559999" in phones
         assert len(result) == 2
 
-    def test_ignores_files_without_comment(self, isolated_tenant_dir: Path):
-        (isolated_tenant_dir / "junk.txt").write_text("no comment header")
-        assert list_tenants() == []
-
-
-# ---------------------------------------------------------------------------
-# Empty tenant profile (H6)
-# ---------------------------------------------------------------------------
-
-
-class TestEmptyProfile:
-    @pytest.mark.parametrize(
-        "content",
-        [f"# {TENANT_PHONE}\n", f"# {TENANT_PHONE}"],
-        ids=["comment_with_newline", "comment_no_newline"],
-    )
-    def test_comment_only_raises(self, isolated_tenant_dir: Path, content: str):
-        """A file with only a comment header (with or without newline) must crash."""
+    def test_lists_legacy_txt_tenants(self, isolated_tenant_dir: Path):
+        """Legacy .txt files should appear in tenant listing."""
         path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.txt"
-        path.write_text(content)
-        with pytest.raises(TenantNotFoundError, match="empty"):
-            load_tenant_profile(TENANT_PHONE)
-
-    @pytest.mark.parametrize(
-        "content",
-        [f"# {TENANT_PHONE}\n   \n  \n", "   \n  \n"],
-        ids=["comment_plus_whitespace", "whitespace_only"],
-    )
-    def test_whitespace_only_raises(self, isolated_tenant_dir: Path, content: str):
-        """A file with only whitespace (with or without comment header) must crash."""
-        path = isolated_tenant_dir / f"{phone_to_filename(TENANT_PHONE)}.txt"
-        path.write_text(content)
-        with pytest.raises(TenantNotFoundError, match="empty"):
-            load_tenant_profile(TENANT_PHONE)
+        path.write_text(f"# {TENANT_PHONE}\nprofile text")
+        result = list_tenants()
+        phones = [phone for phone, _ in result]
+        assert TENANT_PHONE in phones
