@@ -102,7 +102,7 @@ def _serialize_config(config: TenantConfig) -> bytes:
         "boss_numbers": config.boss_numbers,
         "profile": {"text": config.profile},
     }
-    return tomli_w.dumps(data).encode("utf-8")
+    return tomli_w.dumps(data, multiline_strings=True).encode("utf-8")
 
 
 def _deserialize_config(raw: bytes) -> TenantConfig:

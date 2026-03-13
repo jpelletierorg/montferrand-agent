@@ -70,20 +70,37 @@ class TestRequireEnv:
 
 
 class TestRenderPrompt:
-    def test_injects_tenant_profile(self):
+    def test_injects_tenant_profile(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("MONTFERRAND_TIMEZONE", "America/Montreal")
         result = render_prompt("Plomberie Test\n- hourly rate: $100")
         assert "Plomberie Test" in result
         assert "hourly rate: $100" in result
 
     def test_template_has_placeholder(self):
         assert "{tenant_profile}" in MASTER_PROMPT_TEMPLATE
+        assert "{current_datetime}" in MASTER_PROMPT_TEMPLATE
 
-    def test_profile_with_curly_braces_does_not_crash(self):
+    def test_profile_with_curly_braces_does_not_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
         """H1 regression: profiles containing { or } must not crash."""
+        monkeypatch.setenv("MONTFERRAND_TIMEZONE", "America/Montreal")
         profile = "Hours: {lundi-vendredi} 8h-17h\nNotes: use {{special}} rates"
         result = render_prompt(profile)
         assert "{lundi-vendredi}" in result
         assert "{{special}}" in result
+
+    def test_injects_current_datetime(self, monkeypatch: pytest.MonkeyPatch):
+        """The rendered prompt includes date, time, and timezone."""
+        monkeypatch.setenv("MONTFERRAND_TIMEZONE", "America/Montreal")
+        result = render_prompt("test profile")
+        assert "CURRENT DATE AND TIME:" in result
+        assert "America/Montreal" in result
+
+    def test_missing_timezone_crashes(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("MONTFERRAND_TIMEZONE", raising=False)
+        with pytest.raises(RuntimeError, match="MONTFERRAND_TIMEZONE"):
+            render_prompt("test profile")
 
 
 # ---------------------------------------------------------------------------

@@ -76,7 +76,7 @@ DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # ---------------------------------------------------------------------------
 
 MASTER_PROMPT_TEMPLATE = """\
-TODAY'S DATE: {current_date}
+CURRENT DATE AND TIME: {current_datetime}
 
 IDENTITY:
 - You are a booking assistant for a residential plumbing company in Quebec.
@@ -209,7 +209,7 @@ DEMO_TENANT_PROFILE = """\
 # ---------------------------------------------------------------------------
 
 BOSS_PROMPT_TEMPLATE = """\
-TODAY'S DATE: {current_date}
+CURRENT DATE AND TIME: {current_datetime}
 
 IDENTITY:
 - You are the business assistant for a plumbing company. You are talking to the business owner (the boss), not a customer.
@@ -239,15 +239,25 @@ CAPABILITIES:
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
-_TZ = ZoneInfo("America/Montreal")
+
+def _get_timezone() -> ZoneInfo:
+    """Return the configured timezone, or crash if not set."""
+    tz_name = os.getenv("MONTFERRAND_TIMEZONE", "").strip()
+    if not tz_name:
+        raise RuntimeError(
+            "MONTFERRAND_TIMEZONE is not set. "
+            "Add it to your .env file (e.g. MONTFERRAND_TIMEZONE=America/Montreal)."
+        )
+    return ZoneInfo(tz_name)
 
 
 def _inject_date(template: str, tenant_profile: str) -> str:
-    """Replace {tenant_profile} and {current_date} in a prompt template."""
-    today = datetime.now(_TZ)
-    current_date = today.strftime("%Y-%m-%d %A")
+    """Replace {tenant_profile} and {current_datetime} in a prompt template."""
+    tz = _get_timezone()
+    now = datetime.now(tz)
+    current_datetime = now.strftime(f"%Y-%m-%d %A %H:%M {tz}")
     return template.replace("{tenant_profile}", tenant_profile).replace(
-        "{current_date}", current_date
+        "{current_datetime}", current_datetime
     )
 
 
