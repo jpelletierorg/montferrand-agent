@@ -3,89 +3,81 @@
 
 <section id="prix" class="py-20 md:py-28">
   <div class="mx-auto max-w-6xl px-4 md:px-8">
-    <h2 class="font-serif text-3xl md:text-4xl font-bold text-primary text-center tracking-tight">
-      Essayez sans risque pendant 30 jours. 100 % satisfait ou remboursé.
+
+    <!-- Section header -->
+    <p class="text-accent font-bold text-sm uppercase tracking-widest text-center">Prix</p>
+    <h2 class="mt-3 font-serif text-3xl md:text-4xl lg:text-5xl font-bold text-primary text-center tracking-tight leading-tight max-w-3xl mx-auto">
+      Moins cher qu'un employé de réception.<br class="hidden sm:block" /> En poste 24/7.
     </h2>
+    <p class="mt-4 text-center text-muted-foreground max-w-2xl mx-auto text-sm md:text-base leading-relaxed">
+      Votre gestion administrative à une <b><i>fraction du prix</i></b> d'un employé de réception.
+    </p>
 
-    <div class="mt-14 grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
+    <div class="mt-14 flex flex-col items-center">
 
-      <!-- Pricing card -->
-      <div class="relative bg-primary text-primary-foreground rounded-xl p-8 shadow-xl">
-        <span class="absolute top-4 right-4 text-xs font-semibold uppercase tracking-wider bg-accent text-accent-foreground px-3 py-1 rounded-full">
-          Nouveau
+      <!-- Pricing card — stacked on mobile, side-by-side on desktop -->
+      <div class="relative bg-primary text-primary-foreground rounded-2xl shadow-2xl max-w-3xl w-full">
+
+        <!-- Urgency badge -->
+        <span class="absolute -top-3.5 left-1/2 -translate-x-1/2 text-xs font-bold uppercase tracking-wider bg-accent text-accent-foreground px-4 py-1.5 rounded-full shadow-md whitespace-nowrap z-10">
+          20 places disponibles
         </span>
 
-        <p class="text-sm font-medium text-primary-foreground/70 mt-2">Forfait Unique</p>
+        <div class="flex flex-col md:flex-row">
 
-        <div class="mt-4 flex items-baseline gap-1">
-          <span class="font-serif text-5xl md:text-6xl font-bold">59,99 $</span>
-          <span class="text-lg text-primary-foreground/60">/ mois</span>
-        </div>
+          <!-- Left: Price -->
+          <div class="md:w-[42%] p-8 md:p-10 flex flex-col items-center justify-center text-center">
+            <p class="text-sm font-medium text-primary-foreground/60 uppercase tracking-wider">Tarif de lancement</p>
 
-        <ul class="mt-8 space-y-3">
-          <li class="flex items-center gap-2 text-sm">
-            <svg class="w-5 h-5 text-accent flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            30 jours gratuits
-          </li>
-          <li class="flex items-center gap-2 text-sm">
-            <svg class="w-5 h-5 text-accent flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Aucun contrat à long terme
-          </li>
-          <li class="flex items-center gap-2 text-sm">
-            <svg class="w-5 h-5 text-accent flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Conversations SMS illimitées
-          </li>
-          <li class="flex items-center gap-2 text-sm">
-            <svg class="w-5 h-5 text-accent flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Support technique local
-          </li>
-        </ul>
+            <div class="mt-3 flex items-baseline gap-2">
+              <span class="text-lg text-primary-foreground/40 line-through decoration-primary-foreground/30">299&nbsp;$</span>
+              <span class="font-serif text-5xl md:text-6xl font-bold">149&nbsp;$</span>
+            </div>
+            <span class="text-base text-primary-foreground/50 mt-1">/ mois</span>
 
-        <a href="#onboarding" class="mt-8 inline-flex items-center justify-center w-full px-6 py-3.5 text-sm font-semibold rounded-full bg-accent text-accent-foreground hover:bg-accent-hover transition-colors">
-          Commencer l'essai gratuit
-        </a>
+            <!-- CTA -->
+            <a href="#commencer" class="mt-6 inline-flex items-center justify-center w-full px-6 py-3.5 text-sm font-semibold rounded-full bg-accent text-accent-foreground hover:bg-accent-hover transition-colors shadow-md">
+              Commencer maintenant &rarr;
+            </a>
 
-        <!-- Guarantee badge -->
-        <div class="mt-5 flex items-center justify-center gap-2 pt-5 border-t border-primary-foreground/15">
-          <svg class="w-5 h-5 text-accent flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11.5 14.5 15.5 10"/></svg>
-          <span class="text-sm text-primary-foreground/80">Garantie satisfait ou remboursé — 30 jours</span>
+            <p class="mt-4 text-xs text-primary-foreground/35">
+              vs employé de réception à temps plein : ~3&nbsp;200&nbsp;$/mois
+            </p>
+          </div>
+
+          <!-- Divider: horizontal on mobile, vertical on desktop -->
+          <div class="border-t md:border-t-0 md:border-l border-primary-foreground/10 mx-8 md:mx-0 md:my-8"></div>
+
+          <!-- Right: Features -->
+          <div class="md:w-[58%] p-8 md:p-10 flex items-center">
+            <ul class="space-y-3.5 w-full">
+              <li class="flex items-start gap-3 text-sm">
+                <svg class="w-5 h-5 text-accent flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                Disponible 24/7 — nuits, fins de semaine, jours fériés
+              </li>
+
+              <li class="flex items-start gap-3 text-sm">
+                <svg class="w-5 h-5 text-accent flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                Opérationnel en moins de 24 heures
+              </li>
+              <li class="flex items-start gap-3 text-sm">
+                <svg class="w-5 h-5 text-accent flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                Gère plusieurs clients en même temps
+              </li>
+              <li class="flex items-start gap-3 text-sm">
+                <svg class="w-5 h-5 text-accent flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                Connaît vos prix, votre zone et vos disponibilités
+              </li>
+              <li class="flex items-start gap-3 text-sm">
+                <svg class="w-5 h-5 text-accent flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                Conversations SMS illimitées
+              </li>
+            </ul>
+          </div>
+
         </div>
       </div>
 
-      <!-- ROI calculator -->
-      <div>
-        <h3 class="font-serif text-2xl font-bold text-primary">Le calcul est simple</h3>
-
-        <div class="mt-6 space-y-3">
-          <div class="bg-card rounded-lg p-4 shadow-sm border border-border">
-            <div class="flex items-center justify-between">
-              <span class="font-semibold text-sm">1 appel de plus / mois</span>
-              <span class="text-xs font-semibold uppercase tracking-wider text-green-600 bg-green-50 px-2.5 py-1 rounded-full">Rentable</span>
-            </div>
-            <p class="mt-1 text-sm text-muted-foreground">Le système se paie tout seul avec un seul appel de service récupéré.</p>
-          </div>
-
-          <div class="bg-card rounded-lg p-4 shadow-sm border border-border">
-            <div class="flex items-center justify-between">
-              <span class="font-semibold text-sm">3 appels de plus / mois</span>
-              <span class="font-serif text-lg font-bold text-primary">~750 $</span>
-            </div>
-            <p class="mt-1 text-sm text-muted-foreground">De revenus supplémentaires générés pendant que vous dormez.</p>
-          </div>
-
-          <div class="bg-card rounded-lg p-4 shadow-sm border border-border">
-            <div class="flex items-center justify-between">
-              <span class="font-semibold text-sm">5 appels de plus / mois</span>
-              <span class="font-serif text-lg font-bold text-primary">~1 250 $</span>
-            </div>
-            <p class="mt-1 text-sm text-muted-foreground">De revenus supplémentaires générés pendant que vous dormez.</p>
-          </div>
-        </div>
-
-        <p class="mt-4 text-xs text-muted-foreground italic">
-          * Basé sur une estimation prudente de 250 $ par appel de service résidentiel.
-        </p>
-      </div>
     </div>
   </div>
 </section>
