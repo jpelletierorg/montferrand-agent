@@ -1,9 +1,11 @@
 """Shared fixtures and constants for the Montferrand test suite."""
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+import montferrand_agent.crm as crm_module
 from montferrand_agent.tenant import save_tenant_profile
 
 # ---------------------------------------------------------------------------
@@ -69,3 +71,77 @@ def sms_tenant(
     """
     save_tenant_profile(TWILIO_NUMBER, TEST_PROFILE)
     return isolated_tenant_dir
+
+
+def _migration_version(path: Path) -> str:
+    return path.name.split("_", maxsplit=1)[0]
+
+
+def _read_up_sql(path: Path) -> str:
+    lines: list[str] = []
+    capture = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("-- migrate:up"):
+            capture = True
+            continue
+        if line.startswith("-- migrate:down"):
+            capture = False
+            continue
+        if capture:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+@pytest.fixture
+def fake_dbmate(monkeypatch: pytest.MonkeyPatch):
+    """Patch CRM dbmate calls with a lightweight in-process SQLite runner."""
+
+    migration_files = sorted(crm_module.crm_migrations_dir().glob("*.sql"))
+
+    def fake_run_dbmate(db_path: Path, command: str) -> None:
+        if command == "up":
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+        elif not db_path.exists():
+            raise RuntimeError(f"missing db for fake dbmate: {db_path}")
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY)"
+        )
+        try:
+            if command in {"up", "migrate"}:
+                applied = {
+                    row[0]
+                    for row in conn.execute("SELECT version FROM schema_migrations")
+                }
+                for migration_path in migration_files:
+                    version = _migration_version(migration_path)
+                    if version in applied:
+                        continue
+                    script = _read_up_sql(migration_path)
+                    if script:
+                        conn.executescript(script)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version) VALUES (?)",
+                        (version,),
+                    )
+                conn.commit()
+                return
+
+            if command == "status":
+                applied = {
+                    row[0]
+                    for row in conn.execute("SELECT version FROM schema_migrations")
+                }
+                expected = {_migration_version(path) for path in migration_files}
+                if applied != expected:
+                    missing = ", ".join(sorted(expected - applied)) or "unknown"
+                    raise RuntimeError(f"pending migrations: {missing}")
+                return
+
+            raise RuntimeError(f"unsupported fake dbmate command: {command}")
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(crm_module, "_run_dbmate", fake_run_dbmate)
+    return fake_run_dbmate

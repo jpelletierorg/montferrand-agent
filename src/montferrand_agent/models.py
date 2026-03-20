@@ -1,15 +1,23 @@
 """Output types for the Montferrand booking agent.
 
-The agent returns exactly one of two types on each turn:
+The app exposes two public result types:
 - Dialog: the conversation continues, the agent needs more information.
 - Report: the agent has everything it needs to book a service visit.
 
-Field descriptions and examples are passed into the LLM context window via
-the JSON schema, so they must clearly describe what each field is for and
-how the model should fill it.
+Internally, the LLM returns a single structured ``AgentTurn`` object. Using a
+single schema keeps native structured-output backends like Inception and Claude
+via OpenRouter on a simpler, more stable protocol than a top-level union.
+
+Field descriptions and examples are passed into the LLM context window via the
+JSON schema, so they must clearly describe what each field is for and how the
+model should fill it.
 """
 
-from pydantic import BaseModel, Field
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class Dialog(BaseModel):
@@ -30,6 +38,21 @@ class Dialog(BaseModel):
             "Merci. Pouvez-vous me donner votre adresse pour qu'on planifie la visite?",
             "OK, I can help with that. Is the leak actively dripping right now?",
         ],
+    )
+
+
+class BossReply(BaseModel):
+    """Open-ended boss/control-plane reply.
+
+    Boss conversations never terminate in a booking report state; each turn is
+    simply another operational reply.
+    """
+
+    message: str = Field(
+        description=(
+            "The SMS message to send back to the boss. Keep it direct, concise, "
+            "and operational."
+        )
     )
 
 
@@ -95,3 +118,90 @@ class Report(BaseModel):
             "demain 13h a 15h",
         ],
     )
+
+
+class AgentTurn(BaseModel):
+    """Single structured result returned by the LLM on each turn.
+
+    ``kind='dialog'`` means the conversation continues and only ``message`` is
+    required. ``kind='report'`` means the booking is complete and all report
+    fields must be present.
+    """
+
+    kind: Literal["dialog", "report"] = Field(
+        description=(
+            "What kind of turn this is. Use 'dialog' when the conversation is "
+            "still in progress. Use 'report' only when the booking is complete."
+        )
+    )
+
+    message: str = Field(
+        description=(
+            "The SMS message to send to the user right now. Keep it short and "
+            "natural for SMS."
+        )
+    )
+
+    customer_name: str | None = Field(
+        default=None,
+        description=(
+            "The customer's full name when kind='report'. Leave null while the "
+            "conversation is still in progress."
+        ),
+    )
+    service_location: str | None = Field(
+        default=None,
+        description=(
+            "The street address for the visit when kind='report'. Leave null "
+            "while the conversation is still in progress."
+        ),
+    )
+    issue_description: str | None = Field(
+        default=None,
+        description=(
+            "A concise plumber-facing description of the problem when "
+            "kind='report'. Leave null while the conversation is still in "
+            "progress."
+        ),
+    )
+    appointment_window: str | None = Field(
+        default=None,
+        description=(
+            "The mutually agreed appointment slot when kind='report'. Leave "
+            "null while the conversation is still in progress."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_report_fields(self) -> AgentTurn:
+        if self.kind == "report":
+            missing = [
+                field_name
+                for field_name in (
+                    "customer_name",
+                    "service_location",
+                    "issue_description",
+                    "appointment_window",
+                )
+                if not getattr(self, field_name)
+            ]
+            if missing:
+                names = ", ".join(missing)
+                raise ValueError(
+                    f"Report turns must include all booking fields. Missing: {names}."
+                )
+        return self
+
+    def to_public_result(self) -> Dialog | Report:
+        """Convert the internal turn schema to the app's public result types."""
+
+        if self.kind == "dialog":
+            return Dialog(message=self.message)
+
+        return Report(
+            message=self.message,
+            customer_name=self.customer_name or "",
+            service_location=self.service_location or "",
+            issue_description=self.issue_description or "",
+            appointment_window=self.appointment_window or "",
+        )

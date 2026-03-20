@@ -1,0 +1,17 @@
+version: '3'
+
+tasks:
+  build:web:
+    desc: Build the Astro web app
+    dir: web
+    cmds:
+      - npm run build
+
+  deploy:web:
+    desc: Build and deploy the web app to Cloudflare Pages
+    aliases:
+      - deploy-web
+    deps:
+      - build:web
+    cmds:
+      - node scripts/deploy-web.mjs

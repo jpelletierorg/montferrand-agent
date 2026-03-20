@@ -3,16 +3,20 @@
 All tests are pure logic — no LLM calls.
 """
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic_evals.evaluators import EvaluationReason
 
 from montferrand_agent.evals import (
+    BossEvalResult,
     ConversationResult,
     NoSlowTurns,
     Scenario,
+    ToolUseSmokeResult,
     _display_name,
     _pass_fail,
+    main,
 )
 
 
@@ -42,6 +46,7 @@ class TestDisplayName:
     def test_known_name(self):
         assert _display_name("ConversationConverged") == "Converged"
         assert _display_name("diagnostic_expertise") == "Diagnostic"
+        assert _display_name("explicit_booking_dates") == "Dates"
         assert _display_name("NoSlowTurns") == "Speed"
 
     def test_unknown_name_returns_itself(self):
@@ -105,3 +110,80 @@ class TestNoSlowTurns:
         result = evaluator.evaluate(_make_ctx([2.0, 3.5]))
         assert isinstance(result, EvaluationReason)
         assert result.value is False
+
+
+class TestMainExitBehavior:
+    def test_main_exits_non_zero_on_tool_use_smoke_failure(self):
+        failing_smoke = ToolUseSmokeResult(
+            fixture_name="fixture",
+            expected_tool_name="tool_create_service_call",
+            expected_location="123 rue Test",
+            calls=[],
+            output_kind=None,
+            output_message=None,
+            error=None,
+        )
+        passing_boss = BossEvalResult(
+            scenario_name="boss_french_language_match",
+            input_message="quoi?",
+            output_message="D'accord.",
+            passed=True,
+        )
+
+        with (
+            patch(
+                "montferrand_agent.evals._run_main",
+                return_value=(
+                    SimpleNamespace(cases=[]),
+                    [failing_smoke],
+                    [passing_boss],
+                ),
+            ),
+            patch("montferrand_agent.evals.print_report"),
+            patch("montferrand_agent.evals.print_tool_use_report"),
+            patch("montferrand_agent.evals.print_boss_eval_report"),
+        ):
+            try:
+                main(model_name=None)
+            except SystemExit as exc:
+                assert exc.code == 1
+            else:
+                raise AssertionError("Expected SystemExit(1)")
+
+    def test_main_exits_non_zero_on_boss_eval_failure(self):
+        passing_smoke = ToolUseSmokeResult(
+            fixture_name="fixture",
+            expected_tool_name="tool_check_availability",
+            expected_location="",
+            calls=[],
+            output_kind=None,
+            output_message=None,
+            error=None,
+        )
+        failing_boss = BossEvalResult(
+            scenario_name="boss_french_language_match",
+            input_message="quoi?",
+            output_message="Hello",
+            passed=False,
+            error="Boss reply switched to English.",
+        )
+
+        with (
+            patch(
+                "montferrand_agent.evals._run_main",
+                return_value=(
+                    SimpleNamespace(cases=[]),
+                    [passing_smoke],
+                    [failing_boss],
+                ),
+            ),
+            patch("montferrand_agent.evals.print_report"),
+            patch("montferrand_agent.evals.print_tool_use_report"),
+            patch("montferrand_agent.evals.print_boss_eval_report"),
+        ):
+            try:
+                main(model_name=None)
+            except SystemExit as exc:
+                assert exc.code == 1
+            else:
+                raise AssertionError("Expected SystemExit(1)")

@@ -3,25 +3,28 @@
 Provides subcommands:
 
     uv run montferrand cli                — interactive conversation loop
+    uv run montferrand crm provision      — provision tenant CRM database
+    uv run montferrand latency            — benchmark raw model latency
     uv run montferrand evals              — run the eval suite
     uv run montferrand serve              — start the webhook server
     uv run montferrand onboard            — register a new tenant
     uv run montferrand tenant edit        — edit a tenant's prompt
     uv run montferrand tenant list        — list configured tenants
     uv run montferrand calendar          — show booked events for a tenant
-    uv run montferrand reset              — wipe conversation data for a tenant
+    uv run montferrand reset              — wipe conversation data and reset calendar
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import sys
 import tempfile
 from datetime import date, timedelta
 from pathlib import Path
-from typing import NoReturn
+from typing import Literal, NoReturn, TypeAlias
 
 import httpx
 import typer
@@ -30,8 +33,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from montferrand_agent.agent import DEMO_TENANT_PROFILE, get_model_name
+from montferrand_agent.agent import (
+    DEMO_TENANT_PROFILE,
+    get_model_name,
+    get_provider_name,
+    get_structured_output_strategy,
+)
 from montferrand_agent.conversation import (
+    ConversationTraceEvent,
     ConversationCost,
     ConversationError,
     get_cost,
@@ -40,7 +49,21 @@ from montferrand_agent.conversation import (
     reset,
     reset_tenant,
 )
+from montferrand_agent.crm import (
+    TenantCrmError,
+    migrate_all_tenant_crm,
+    migrate_tenant_crm,
+    provision_all_tenant_crm,
+    provision_tenant_crm,
+    verify_all_tenant_crm,
+)
+from montferrand_agent.latency import LatencyReport, run_latency_benchmark
 from montferrand_agent.models import Report
+from montferrand_agent.ops import (
+    find_messages,
+    get_message_timeline,
+    run_readiness_checks,
+)
 from montferrand_agent.tenant import (
     TenantConfig,
     TenantNotFoundError,
@@ -48,7 +71,7 @@ from montferrand_agent.tenant import (
     load_tenant_config,
     load_tenant_profile,
     save_tenant_config,
-    save_tenant_profile,
+    tenant_exists,
 )
 
 app = typer.Typer(
@@ -61,8 +84,21 @@ tenant_app = typer.Typer(
     help="Manage tenant configurations.",
     add_completion=False,
 )
+crm_app = typer.Typer(
+    name="crm",
+    help="Manage tenant CRM databases.",
+    add_completion=False,
+)
+ops_app = typer.Typer(
+    name="ops",
+    help="Operations and incident tooling.",
+    add_completion=False,
+)
 app.add_typer(tenant_app, name="tenant")
+app.add_typer(crm_app, name="crm")
+app.add_typer(ops_app, name="ops")
 console = Console()
+CliAgentRole: TypeAlias = Literal["customer", "boss"]
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -78,6 +114,82 @@ def _fatal(message: str) -> NoReturn:
     """Render an error message and exit with code 1."""
     _print_error(message)
     raise typer.Exit(1)
+
+
+def _format_incident_preview(text: str | None, limit: int = 70) -> str:
+    """Return a compact one-line preview for incident output."""
+
+    if not text:
+        return ""
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _render_incident_timeline(
+    message_sid: str | None = None,
+    message_id: str | None = None,
+) -> None:
+    """Render one incident timeline from the ops store."""
+
+    timeline = get_message_timeline(message_sid=message_sid, message_id=message_id)
+    if timeline is None:
+        lookup = message_sid or message_id or "<unknown>"
+        _fatal(f"No incident record found for {lookup}")
+
+    message, events = timeline
+    summary = Table(show_header=False, box=None)
+    summary.add_column(style="bold")
+    summary.add_column()
+    summary.add_row("Inbound SID", message.message_sid or "-")
+    summary.add_row("Message ID", message.message_id)
+    summary.add_row("Conversation", message.conversation_id)
+    summary.add_row("Tenant", message.twilio_number)
+    summary.add_row("Customer", message.from_number)
+    summary.add_row("Boss Flow", "yes" if message.is_boss else "no")
+    summary.add_row("Last Stage", message.last_stage)
+    summary.add_row("Updated", message.updated_at)
+    if message.outbound_message_sid:
+        summary.add_row("Outbound SID", message.outbound_message_sid)
+    if message.error_text:
+        summary.add_row(
+            "Error", _format_incident_preview(message.error_text, limit=120)
+        )
+    if message.reply_body:
+        summary.add_row(
+            "Reply", _format_incident_preview(message.reply_body, limit=120)
+        )
+
+    console.print(summary)
+    console.print()
+
+    event_table = Table(title="Timeline", show_lines=False)
+    event_table.add_column("When", style="dim")
+    event_table.add_column("Event", style="bold")
+    event_table.add_column("Summary")
+    for event in events:
+        event_table.add_row(event.created_at, event.event_kind, event.summary)
+    console.print(event_table)
+
+
+@contextlib.contextmanager
+def _temporary_env(**overrides: str | None):
+    """Temporarily override environment variables for one CLI command."""
+
+    original: dict[str, str | None] = {name: os.environ.get(name) for name in overrides}
+    try:
+        for name, value in overrides.items():
+            if value is None:
+                continue
+            os.environ[name] = value
+        yield
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _require_admin_token() -> str:
@@ -157,6 +269,18 @@ def _push_to_remote(
         _fatal(f"Remote error {response.status_code}: {response.text}")
 
 
+def _prepare_local_tenant_resources(twilio_number: str, *, create: bool) -> Path:
+    from montferrand_agent.calendar import ensure_tenant_calendar
+
+    ensure_tenant_calendar(twilio_number)
+    try:
+        if create:
+            return provision_tenant_crm(twilio_number)
+        return migrate_tenant_crm(twilio_number)
+    except TenantCrmError as exc:
+        _fatal(str(exc))
+
+
 # ---------------------------------------------------------------------------
 # cli subcommand
 # ---------------------------------------------------------------------------
@@ -172,6 +296,7 @@ _CONVERSATION_OVER_MSG = (
     "[dim]Conversation terminee. Tapez !reset pour recommencer.[/dim]"
 )
 _DIALOG_IN_PROGRESS_MSG = "[dim][Dialog — conversation en cours][/dim]"
+_CLI_CUSTOMER_PHONE = "+15550000001"
 
 
 def _format_token_usage(cost: ConversationCost) -> str:
@@ -237,6 +362,170 @@ def _print_cost(cost: ConversationCost) -> None:
         )
 
 
+def _build_cli_banner_text(
+    agent_role: CliAgentRole,
+    model_name: str,
+    provider_name: str,
+    structured_output_strategy: str,
+) -> str:
+    """Build the interactive CLI banner text."""
+
+    title = "Agent SMS" if agent_role == "customer" else "Agent Boss"
+
+    return (
+        f"[bold]Plomberie Montferrand[/bold] — {title} (demo)\n"
+        f"Role: [dim]{agent_role}[/dim]\n"
+        f"Provider: [dim]{provider_name}[/dim]\n"
+        f"Model: [dim]{model_name}[/dim]\n"
+        f"Structured output: [dim]{structured_output_strategy}[/dim]\n\n" + HELP_TEXT
+    )
+
+
+def _print_backend_notice(provider_name: str, structured_output_strategy: str) -> None:
+    """Display a small notice when the active backend details change."""
+
+    console.print(
+        f"[dim]Backend actif: {provider_name} / {structured_output_strategy}[/dim]"
+    )
+
+
+def _format_trace_event(event: ConversationTraceEvent) -> str:
+    """Format a conversation trace event for CLI output."""
+
+    prefix = f"t+{event.at_seconds:.1f}s"
+
+    if event.kind == "request_started":
+        return f"{prefix} request #{event.request_index} started - {event.summary}"
+
+    if event.kind == "request_finished":
+        return (
+            f"{prefix} request #{event.request_index} finished in "
+            f"{event.elapsed_seconds:.1f}s - {event.summary}"
+        )
+
+    if event.kind == "tool_called":
+        return f"{prefix} tool call - {event.summary}"
+
+    if event.kind == "tool_result":
+        return (
+            f"{prefix} tool result - {event.tool_name} in "
+            f"{event.elapsed_seconds:.1f}s - {event.summary}"
+        )
+
+    if event.kind == "tool_retry":
+        return (
+            f"{prefix} tool retry - {event.tool_name or 'result'} in "
+            f"{event.elapsed_seconds:.1f}s - {event.summary}"
+        )
+
+    if event.kind == "warning":
+        return f"{prefix} warning - {event.summary}"
+
+    return f"{prefix} turn finished in {event.elapsed_seconds:.1f}s - {event.summary}"
+
+
+def _print_trace_event(event: ConversationTraceEvent) -> None:
+    """Render a trace event in a subdued CLI style."""
+
+    console.print(f"[dim]trace[/dim] {_format_trace_event(event)}")
+
+
+def _format_latency_seconds(seconds: float | None) -> str:
+    """Render a latency duration with one decimal place."""
+
+    if seconds is None:
+        return "-"
+    return f"{seconds:.2f}s"
+
+
+def _preview_latency_error(error: str | None, limit: int = 80) -> str:
+    """Return a compact single-line error preview for the latency table."""
+
+    if not error:
+        return ""
+    compact = " ".join(error.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _print_latency_report(report: LatencyReport) -> None:
+    """Render the raw model latency benchmark report."""
+
+    console.print()
+    console.print("[bold]Latency Benchmark[/bold]")
+    console.print(
+        "[dim]Raw model benchmark: plain text only, no Montferrand prompt, no tools.[/dim]"
+    )
+    console.print(f"Provider: [bold]{report.provider}[/bold]")
+    console.print(f"Model: [bold]{report.model_name}[/bold]")
+    console.print(f"Prompt: [dim]{report.prompt}[/dim]")
+    console.print(f"Instruction context: [bold]{report.instruction_chars} chars[/bold]")
+    console.print(f"Parallel requests: [bold]{len(report.samples)}[/bold]")
+    console.print()
+
+    table = Table(show_header=True)
+    table.add_column("Request", justify="right")
+    table.add_column("Status")
+    table.add_column("Latency", justify="right")
+    table.add_column("Details")
+
+    for sample in report.samples:
+        table.add_row(
+            str(sample.index),
+            "ok" if sample.success else "error",
+            _format_latency_seconds(sample.elapsed_seconds),
+            "" if sample.success else _preview_latency_error(sample.error),
+        )
+
+    console.print(table)
+    console.print()
+    console.print(
+        f"Average latency: [bold]{_format_latency_seconds(report.average_latency_seconds)}[/bold]"
+    )
+    console.print(
+        "Min / Max: "
+        f"[bold]{_format_latency_seconds(report.min_latency_seconds)}[/bold] / "
+        f"[bold]{_format_latency_seconds(report.max_latency_seconds)}[/bold]"
+    )
+    console.print(
+        f"Wall clock: [bold]{_format_latency_seconds(report.wall_seconds)}[/bold]"
+    )
+    console.print(
+        f"Successes: [bold]{report.success_count}[/bold] / {len(report.samples)}"
+    )
+
+    console.print()
+    console.print("[bold]Responses[/bold]")
+    for sample in report.samples:
+        if sample.success:
+            response = sample.response_text or ""
+            console.print(f"{sample.index}. {response}")
+        else:
+            console.print(
+                f"{sample.index}. [red]ERROR:[/red] {_preview_latency_error(sample.error, limit=200)}"
+            )
+
+
+async def _latency_command(
+    *,
+    model_name: str | None,
+    provider: str | None,
+    samples: int,
+) -> None:
+    """Run the raw model latency benchmark and print the report."""
+
+    report = await run_latency_benchmark(
+        model_name=model_name,
+        provider=provider,  # type: ignore[arg-type]
+        samples=samples,
+    )
+    _print_latency_report(report)
+
+    if report.success_count == 0:
+        raise typer.Exit(1)
+
+
 def _end_conversation(conversation_id: str) -> None:
     """Print the current conversation cost summary."""
     _print_cost(get_cost(conversation_id))
@@ -269,15 +558,60 @@ def _resolve_cli_tenant() -> tuple[str, str]:
 
 
 @app.command()
-def cli() -> None:
+def cli(
+    agent: CliAgentRole = typer.Option(
+        "customer",
+        "--agent",
+        help="Which interactive agent to run: customer or boss.",
+    ),
+    trace: bool = typer.Option(
+        False,
+        "--trace",
+        help="Show live model and tool activity while a turn is running.",
+    ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Override the model name for this CLI session.",
+    ),
+) -> None:
     """Interactive conversation with the Montferrand booking agent."""
-    asyncio.run(_cli_loop())
+    with _temporary_env(MONTFERRAND_MODEL=model):
+        asyncio.run(_cli_loop(agent_role=agent, trace=trace))
 
 
-async def _cli_loop() -> None:
+@app.command()
+def latency(
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Override the model name for this benchmark run.",
+    ),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="Override the backend provider: openrouter or inception.",
+    ),
+    samples: int = typer.Option(
+        10,
+        "--samples",
+        min=1,
+        help="Number of parallel requests to launch.",
+    ),
+) -> None:
+    """Measure raw model latency with parallel plain-text requests."""
+
+    asyncio.run(_latency_command(model_name=model, provider=provider, samples=samples))
+
+
+async def _cli_loop(
+    *, agent_role: CliAgentRole = "customer", trace: bool = False
+) -> None:
     """Async interactive conversation loop."""
     try:
         model_name = get_model_name()
+        provider_name = get_provider_name()
+        structured_output_strategy = get_structured_output_strategy()
     except Exception as exc:
         _print_error(f"Erreur de configuration: {exc}")
         return
@@ -286,8 +620,12 @@ async def _cli_loop() -> None:
 
     console.print(
         Panel(
-            f"[bold]Plomberie Montferrand[/bold] — Agent SMS (demo)\n"
-            f"Model: [dim]{model_name}[/dim]\n\n" + HELP_TEXT,
+            _build_cli_banner_text(
+                agent_role,
+                model_name,
+                provider_name,
+                structured_output_strategy,
+            ),
             border_style="blue",
         )
     )
@@ -344,6 +682,9 @@ async def _cli_loop() -> None:
                 images or None,
                 tenant_profile=tenant_profile,
                 twilio_number=twilio_number,
+                is_boss=agent_role == "boss",
+                customer_phone=None if agent_role == "boss" else _CLI_CUSTOMER_PHONE,
+                trace_observer=_print_trace_event if trace else None,
             )
         except ConversationError as exc:
             _print_error(f"Erreur: {exc}")
@@ -361,6 +702,16 @@ async def _cli_loop() -> None:
         else:
             console.print(_DIALOG_IN_PROGRESS_MSG)
 
+        current_provider_name = get_provider_name()
+        current_strategy = get_structured_output_strategy()
+        if (
+            current_provider_name != provider_name
+            or current_strategy != structured_output_strategy
+        ):
+            provider_name = current_provider_name
+            structured_output_strategy = current_strategy
+            _print_backend_notice(provider_name, structured_output_strategy)
+
         console.print()
 
 
@@ -376,6 +727,14 @@ def serve(
 ) -> None:
     """Start the Montferrand webhook server."""
     import uvicorn
+
+    try:
+        migrated = migrate_all_tenant_crm()
+    except TenantCrmError as exc:
+        _fatal(str(exc))
+
+    if migrated:
+        console.print(f"[green]CRM migrated for {len(migrated)} tenant(s).[/green]")
 
     uvicorn.run(
         "montferrand_agent.server:app",
@@ -437,6 +796,11 @@ def onboard(
     """Register a new tenant with a company profile."""
     remote = _resolve_host(host, local=local)
 
+    if not remote and tenant_exists(twilio_number):
+        _fatal(
+            f"Tenant already exists for {twilio_number}. Use `montferrand tenant edit` instead."
+        )
+
     parsed_boss: list[str] = []
     if boss_numbers:
         parsed_boss = [n.strip() for n in boss_numbers.split(",") if n.strip()]
@@ -476,8 +840,10 @@ def onboard(
             profile=profile,
             boss_numbers=parsed_boss,
         )
+        db_path = _prepare_local_tenant_resources(twilio_number, create=True)
         path = save_tenant_config(config)
         console.print(f"[green]Tenant saved:[/green] {path}")
+        console.print(f"[green]CRM ready:[/green] {db_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -565,13 +931,151 @@ def tenant_edit(
     if remote:
         _push_to_remote(remote, twilio_number, profile, boss_numbers)
     else:
+        if not tenant_exists(twilio_number):
+            _fatal(f"No tenant found for {twilio_number}")
         new_config = TenantConfig(
             phone=twilio_number,
             profile=profile,
             boss_numbers=boss_numbers,
         )
+        db_path = _prepare_local_tenant_resources(twilio_number, create=False)
         path = save_tenant_config(new_config)
         console.print(f"[green]Tenant updated:[/green] {path}")
+        console.print(f"[green]CRM verified:[/green] {db_path}")
+
+
+@crm_app.command("provision")
+def crm_provision(
+    twilio_number: str = typer.Option(
+        ...,
+        "--twilio-number",
+        "-n",
+        help="Tenant phone number (E.164)",
+    ),
+) -> None:
+    """Provision the CRM database for a tenant."""
+    path = _prepare_local_tenant_resources(twilio_number, create=True)
+    console.print(f"[green]CRM provisioned:[/green] {path}")
+
+
+@crm_app.command("provision-all")
+def crm_provision_all() -> None:
+    """Provision CRM databases for all configured tenants."""
+    try:
+        paths = provision_all_tenant_crm()
+    except TenantCrmError as exc:
+        _fatal(str(exc))
+    console.print(f"[green]CRM provisioned for {len(paths)} tenant(s).[/green]")
+
+
+@crm_app.command("migrate-all")
+def crm_migrate_all() -> None:
+    """Apply pending CRM migrations for all configured tenants."""
+    try:
+        paths = migrate_all_tenant_crm()
+    except TenantCrmError as exc:
+        _fatal(str(exc))
+    console.print(f"[green]CRM migrated for {len(paths)} tenant(s).[/green]")
+
+
+@crm_app.command("verify-all")
+def crm_verify_all() -> None:
+    """Verify that all tenant CRM databases exist and are at migration head."""
+    try:
+        paths = verify_all_tenant_crm()
+    except TenantCrmError as exc:
+        _fatal(str(exc))
+    console.print(f"[green]CRM verified for {len(paths)} tenant(s).[/green]")
+
+
+@ops_app.command("doctor")
+def ops_doctor() -> None:
+    """Run local readiness diagnostics for the current environment."""
+
+    checks = run_readiness_checks()
+    table = Table(title="Ops Doctor", show_lines=False)
+    table.add_column("Check", style="bold")
+    table.add_column("Status")
+    table.add_column("Detail")
+
+    for check in checks:
+        status = "ok" if check.ok else "fail"
+        style = "green" if check.ok else "red"
+        table.add_row(check.name, f"[{style}]{status}[/{style}]", check.detail)
+
+    console.print(table)
+    if any(not check.ok for check in checks):
+        raise typer.Exit(1)
+
+
+@ops_app.command("incident")
+def ops_incident(
+    message_sid: str | None = typer.Option(
+        None,
+        "--message-sid",
+        help="Inbound Twilio MessageSid to inspect.",
+    ),
+    message_id: str | None = typer.Option(
+        None,
+        "--message-id",
+        help="Internal ops message ID to inspect.",
+    ),
+    twilio_number: str | None = typer.Option(
+        None,
+        "--twilio-number",
+        help="Filter recent incidents by tenant number.",
+    ),
+    customer_number: str | None = typer.Option(
+        None,
+        "--customer-number",
+        help="Filter recent incidents by customer number.",
+    ),
+    limit: int = typer.Option(
+        10,
+        "--limit",
+        min=1,
+        max=50,
+        help="Number of recent messages to show when listing incidents.",
+    ),
+) -> None:
+    """Inspect one message timeline or list recent matching incidents."""
+
+    if message_sid or message_id:
+        _render_incident_timeline(message_sid=message_sid, message_id=message_id)
+        return
+
+    messages = find_messages(
+        twilio_number=twilio_number,
+        from_number=customer_number,
+        limit=limit,
+    )
+    if not messages:
+        console.print("[dim]No incident records found.[/dim]")
+        raise typer.Exit(1)
+
+    if len(messages) == 1:
+        _render_incident_timeline(messages[0].message_sid, messages[0].message_id)
+        return
+
+    table = Table(title="Recent Incidents", show_lines=False)
+    table.add_column("Updated", style="dim")
+    table.add_column("Inbound SID")
+    table.add_column("Tenant", style="bold")
+    table.add_column("Customer")
+    table.add_column("Stage")
+    table.add_column("Reply")
+
+    for message in messages:
+        table.add_row(
+            message.updated_at,
+            message.message_sid or message.message_id,
+            message.twilio_number,
+            message.from_number,
+            message.last_stage,
+            _format_incident_preview(message.reply_body),
+        )
+
+    console.print(table)
 
 
 @tenant_app.command("list")
@@ -634,7 +1138,7 @@ def _select_tenant_interactive() -> str:
 
 
 def _reset_remote(host: str, twilio_number: str) -> None:
-    """DELETE conversations for a tenant on a remote Montferrand server."""
+    """DELETE conversations and reset the calendar for a tenant remotely."""
     token = _require_admin_token()
     url = f"https://{host}/admin/tenants/{twilio_number}/conversations"
     response = httpx.delete(
@@ -645,8 +1149,8 @@ def _reset_remote(host: str, twilio_number: str) -> None:
     if response.status_code == 200:
         count = response.json().get("deleted", "?")
         console.print(
-            f"[green]Deleted {count} conversation(s) for {twilio_number} "
-            f"on {host}[/green]"
+            f"[green]Deleted {count} conversation(s) and reset the calendar "
+            f"for {twilio_number} on {host}.[/green]"
         )
     else:
         _fatal(f"Remote error {response.status_code}: {response.text}")
@@ -684,7 +1188,7 @@ def calendar_cmd(
     ),
 ) -> None:
     """Show booked events for a tenant's calendar."""
-    from montferrand_agent.calendar import _read_all_events
+    from montferrand_agent.calendar import get_tenant_calendar
 
     if twilio_number is None:
         twilio_number = _select_tenant_interactive()
@@ -693,15 +1197,11 @@ def calendar_cmd(
     start = date.fromisoformat(from_date) if from_date else date.today()
     end = date.fromisoformat(to_date) if to_date else start + timedelta(days=30)
 
-    all_events = _read_all_events(twilio_number)
+    backend = get_tenant_calendar(twilio_number)
+    result = backend.list_events(start.isoformat(), end.isoformat(), include_past=True)
 
     # Filter by date range and sort by start time
-    events = [
-        ev
-        for ev in all_events
-        if ev["start"].date() <= end and ev["end"].date() >= start
-    ]
-    events.sort(key=lambda ev: ev["start"])
+    events = result.events
 
     label = f"Calendar for {twilio_number} ({start} to {end})"
 
@@ -713,23 +1213,31 @@ def calendar_cmd(
     table.add_column("Date", style="bold")
     table.add_column("Time")
     table.add_column("Summary")
+    table.add_column("Location")
     table.add_column("Description")
     if show_uid:
         table.add_column("UID", style="dim")
 
     for ev in events:
-        desc = ev["description"]
+        start_dt = date.fromisoformat(ev.start_iso[:10])
+        start_time = ev.start_iso[11:16]
+        end_time_value = ev.end_iso[11:16]
+        desc = ev.description
+        location = ev.location
         if len(desc) > 60:
             desc = desc[:57] + "..."
+        if len(location) > 40:
+            location = location[:37] + "..."
 
         row = [
-            ev["start"].strftime("%Y-%m-%d"),
-            f"{ev['start'].strftime('%H:%M')} - {ev['end'].strftime('%H:%M')}",
-            ev["summary"],
+            start_dt.isoformat(),
+            f"{start_time} - {end_time_value}",
+            ev.summary,
+            location,
             desc,
         ]
         if show_uid:
-            row.append(ev["uid"][:12] + "...")
+            row.append(ev.uid[:12] + "...")
         table.add_row(*row)
 
     console.print(table)
@@ -755,7 +1263,7 @@ def reset_cmd(
         help="Reset locally even if MONTFERRAND_HOST is set",
     ),
 ) -> None:
-    """Wipe all conversation data for a tenant."""
+    """Wipe all conversation data and reset the tenant calendar."""
     if twilio_number is None:
         twilio_number = _select_tenant_interactive()
 
@@ -765,12 +1273,10 @@ def reset_cmd(
         _reset_remote(remote, twilio_number)
     else:
         count = reset_tenant(twilio_number)
-        if count == 0:
-            console.print(f"[dim]No conversations found for {twilio_number}.[/dim]")
-        else:
-            console.print(
-                f"[green]Deleted {count} conversation(s) for {twilio_number}.[/green]"
-            )
+        console.print(
+            f"[green]Deleted {count} conversation(s) and reset the calendar "
+            f"for {twilio_number}.[/green]"
+        )
 
 
 # ---------------------------------------------------------------------------

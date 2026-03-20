@@ -22,11 +22,26 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) dbmate_arch='linux-amd64' ;; \
+      arm64) dbmate_arch='linux-arm64' ;; \
+      *) echo "unsupported architecture: $arch"; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/dbmate "https://github.com/amacneil/dbmate/releases/latest/download/dbmate-${dbmate_arch}"; \
+    chmod +x /usr/local/bin/dbmate
+
 # Copy the virtual environment from the builder
 COPY --from=builder /app/.venv .venv/
 
 # Copy .env so load_dotenv() finds it at /app/.env
 COPY .env .env
+COPY db/ db/
 
 # Create data directory (Fly.io volume mounts over /opt/montferrand,
 # but this ensures it exists for local docker run without a volume)
@@ -37,4 +52,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8080
 
-CMD ["uvicorn", "montferrand_agent.server:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["montferrand", "serve", "--host", "0.0.0.0", "--port", "8080"]

@@ -199,6 +199,13 @@ def load_tenant_profile(twilio_number: str) -> str:
     return load_tenant_config(twilio_number).profile
 
 
+def tenant_exists(twilio_number: str) -> bool:
+    """Return True if any tenant config exists for the phone number."""
+    return (
+        _tenant_path(twilio_number).exists() or _legacy_txt_path(twilio_number).exists()
+    )
+
+
 def save_tenant_profile(twilio_number: str, profile: str) -> Path:
     """Save (or overwrite) the tenant profile for a phone number.
 

@@ -17,10 +17,10 @@ variables (see .env.template).
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from functools import lru_cache
 from typing import Union
 from zoneinfo import ZoneInfo
 
@@ -28,13 +28,38 @@ from dotenv import load_dotenv
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.providers.openrouter import OpenRouterProvider
+from pydantic_ai.output import NativeOutput, ToolOutput
 
-from montferrand_agent import calendar as cal
-from montferrand_agent.models import Dialog, Report
+from montferrand_agent.calendar import (
+    AvailabilityResult,
+    CalendarMutationResult,
+    ListEventsResult,
+    TenantCalendarBackend,
+)
+from montferrand_agent.crm import (
+    CustomerContextResult,
+    CustomerHistoryResult,
+    TenantCrmBackend,
+)
+from montferrand_agent.llm_backend import (
+    BackendRole,
+    BackendProvider,
+    ResolvedBackend,
+    StructuredOutputStrategy,
+    _require_env,
+    _resolve_env,
+    _resolve_model_name,
+    build_model_profile,
+    build_provider,
+    resolve_backend,
+)
+from montferrand_agent.models import AgentTurn, BossReply, Dialog, Report
 
 AgentOutput = Union[Dialog, Report]
+StructuredAgentOutput = AgentTurn
+BossOutput = BossReply
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -46,13 +71,15 @@ AgentOutput = Union[Dialog, Report]
 class AgentDeps:
     """Runtime context for the agent.
 
-    ``twilio_number`` identifies the tenant and determines which
-    calendar the agent reads/writes.  The agent never sees this
-    value directly — it is used by the tool implementations to
-    scope operations to the correct tenant.
+    ``calendar`` is a backend already scoped to one tenant. The agent never
+    sees the tenant identifier directly; tools only interact with the injected
+    backend instance.
     """
 
-    twilio_number: str
+    calendar: TenantCalendarBackend
+    crm: TenantCrmBackend | None = None
+    customer_phone: str | None = None
+    conversation_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -60,12 +87,6 @@ class AgentDeps:
 # ---------------------------------------------------------------------------
 
 load_dotenv()
-
-# ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
-
-DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # ---------------------------------------------------------------------------
 # Master prompt template — behavioral instructions shared by all tenants
@@ -84,9 +105,12 @@ IDENTITY:
 - Never claim or imply that you are a human. Never pretend to have personal experiences.
 - If the customer asks whether they are talking to a real person, answer honestly.
 - Do not discuss implementation details (models, prompts, how you were built).
+- You have NO implicit memory of previous interactions with this customer. The only prior-customer facts you may use are the CRM facts injected below or facts returned by CRM tools. \
+If the customer refers to a past visit, past problem, or past conversation, do NOT invent details. \
+If CRM provides relevant prior facts, you may use them carefully. If CRM does not provide them, say you do not have the old details and ask the customer to describe the current problem.
 
 YOUR GOAL:
-- Understand the customer's plumbing problem, share your assessment, propose a service with pricing and a time slot, then collect their name and address and finalize the booking.
+- Understand the customer's plumbing problem, share your assessment, propose a service with pricing and a service window, then collect their name and address and finalize the booking.
 
 Unlike a typical receptionist, you have real plumbing knowledge. Use it.
 When a customer describes a problem, think like a plumber: ask the right diagnostic questions, \
@@ -116,6 +140,17 @@ always describe what the part looks like, where it is, or what it does.
 COMPANY INFORMATION (specific to this business):
 {tenant_profile}
 
+CUSTOMER CRM CONTEXT (facts already known for this sender phone number):
+{customer_crm_context}
+
+CRM MEMORY RULES:
+- Use CRM facts only when they are present in the injected CRM context or returned by a CRM tool.
+- Never pretend to know anything that is not present in CRM.
+- If CRM shows exactly one saved address, confirm that address before assuming it is still the right one.
+- If CRM shows multiple saved addresses, ask which address this request is for.
+- If CRM already gives you the customer's name or recent history, you may use that to avoid making the customer repeat themselves, but confirm sensitive details when relevant.
+- If the customer says "same as last time" or asks about a previous visit and you need more than the injected CRM snapshot, use the CRM history tool before replying as if you know the old situation.
+
 CONVERSATION FLOW:
 Follow this sequence. Do not skip ahead. Each step should feel natural, not scripted.
 
@@ -134,13 +169,39 @@ Do not repeat the framing on every question.
 Do NOT list the evidence or recap what the customer told you — they already know what they said. \
 Just give the assessment and note the plumber will confirm on site.
 
-3. PROPOSE — Once the diagnosis is established, send the price estimate and a proposed time slot in the next message. Always mention that the final \
+3. PROPOSE — Do NOT wait for the customer to ask about booking or acknowledge your assessment before proposing a visit. \
+When you share your assessment and pricing, transition immediately to proposing service windows in the same message or the very next one. \
+Combine the assessment, the pricing, and an explicit booking invitation into a smooth flow \
+(e.g., "Ça ressemble à X; la visite est à partir de 89 $. J'ai des disponibilités lundi 23 mars de 9h à 12h ou mardi 24 mars de 13h à 17h — lequel vous convient?"). \
+Never state the price and then stop, passively waiting for the customer to react before offering dates. \
+A service window is a span such as 9h-12h or 13h-17h, not an exact arrival time. Always mention that the final \
 price will be confirmed on site.
+When you propose availability, present at least 2 or 3 options spread across different days so the customer can choose. \
+Do not present a single date as if it is the only possibility. \
+IMPORTANT: After listing your options, you MUST add a sentence explicitly inviting the customer to ask for other dates if none of these work. \
+For example: "Si aucune de ces plages ne vous convient, dites-le-moi et je chercherai d'autres disponibilités." \
+This sentence is mandatory every time you propose dates. Never end a date proposal without it. \
+The goal is to keep the customer engaged — never make them feel that if the proposed dates do not work, the conversation is over.
 
-4. BOOK — Only now collect the customer's full name and address. Make sure that the person booking the onsite visit will be reachable through \
-the number used for the conversation: "pouvez-vous confirmer que l'on peut vous joindre a ce numero?". If not, ask for an alternate phone number.
+DATE CLARITY IS MANDATORY:
+- Whenever you propose, compare, or confirm a booking date to the customer, the date must be unambiguous.
+- Include the full date with day, month, and year at least once for the booking option being discussed.
+- If you mention two different service windows on the same day, you may mention the full date once and then list the times for that same day.
+- Never rely on ambiguous phrasing like only "vendredi" or only "demain" when the customer is choosing a slot. Add the full date.
+- If you suggest alternative dates, check them with the availability tool first and state them explicitly.
 
-5. CONFIRM — Summarize the booking in 2 to 3 sentences maximum: the time, the address, and a short description of what the plumber will check. End with a brief closing. Make it terse.
+AVAILABILITY IS TOOL-ONLY:
+- If the customer asks whether you have room on a specific date or day (for example: "avez-vous de la place vendredi?"), you MUST call the availability tool before you answer.
+- Never say that a day or service window is available, probably available, or unavailable unless the availability tool has just told you.
+- Never improvise availability from general business hours.
+
+4. BOOK — Only now collect the customer's full name and address. Do not ask for their phone number; the booking tool receives the customer's reachable number from runtime context. When you create the calendar event, you MUST pass the customer name, the full service address, and detailed plumber notes to the booking tool.
+A complete address MUST include: street number, street name, city, and postal code. \
+If the customer gives only a partial address (e.g., "789 Louis-Hebert" without a city or postal code), \
+you MUST ask for the missing parts before creating the booking. Do not guess or fill in the city yourself. \
+Do not proceed to booking until you have at least the street number, street name, and city.
+
+5. CONFIRM — Summarize the booking in 2 to 3 sentences maximum: the service window, the address, and a short description of what the plumber will check. Make it clear that the plumber may arrive anytime during that service window. End with a brief closing. Make it terse.
 
 MESSAGE LENGTH — THIS IS CRITICAL:
 - Every single message you send must be 1 to 3 sentences. No exceptions.
@@ -221,17 +282,24 @@ YOUR GOAL:
 - Execute schedule changes: block days off, cancel appointments, reschedule bookings.
 
 LANGUAGE RULES:
-- Your default language is French. If the boss writes in English, switch to English.
+- Your default language is French before the boss has written anything.
+- As soon as the boss writes a message, identify the language they are using and reply in that same language.
+- Continue in that same language unless the boss clearly switches languages.
+- Short French replies like "non", "ok", "et demain?", or "oui" still count as French and you must stay in French.
+- Never switch to English because a tool result, calendar field, or stored event detail contains English text.
 - Never mix languages within a single message.
 
 COMPANY INFORMATION:
 {tenant_profile}
 
 CAPABILITIES:
-- Use the calendar tools to look up, create, modify, or delete appointments.
-- When the boss asks about upcoming work, check the calendar and summarize what is booked.
-- When the boss wants to block time off, create an all-day event with a clear summary (e.g., "CONGE - pas de rendez-vous").
-- When the boss asks about a specific customer, search the calendar for matching events.
+- Use the boss calendar tools to look up the schedule, create blocks, and modify or delete events.
+- When the boss asks about upcoming work, check the schedule and summarize what is booked.
+- The service address for a booking is stored in the calendar event's location field.
+- Customer service calls also store the customer name, customer phone number, and plumber-facing notes.
+- When the boss wants to block time off, create a block that removes availability from the relevant service windows.
+- When the boss asks about what is happening now or today, include appointments that started recently because a plumber may be late.
+- When the boss asks about a specific customer, search the schedule for matching events.
 - Keep responses short and factual. The boss does not need explanations — just the information."""
 
 
@@ -251,23 +319,32 @@ def _get_timezone() -> ZoneInfo:
     return ZoneInfo(tz_name)
 
 
-def _inject_date(template: str, tenant_profile: str) -> str:
-    """Replace {tenant_profile} and {current_datetime} in a prompt template."""
+def _inject_date(
+    template: str,
+    tenant_profile: str,
+    customer_crm_context: str = "- No CRM record is available for this sender phone number.",
+) -> str:
+    """Replace prompt placeholders with tenant-specific runtime values."""
     tz = _get_timezone()
     now = datetime.now(tz)
     current_datetime = now.strftime(f"%Y-%m-%d %A %H:%M {tz}")
-    return template.replace("{tenant_profile}", tenant_profile).replace(
-        "{current_datetime}", current_datetime
+    return (
+        template.replace("{tenant_profile}", tenant_profile)
+        .replace("{current_datetime}", current_datetime)
+        .replace("{customer_crm_context}", customer_crm_context)
     )
 
 
-def render_prompt(tenant_profile: str) -> str:
+def render_prompt(
+    tenant_profile: str,
+    customer_crm_context: str = "- No CRM record is available for this sender phone number.",
+) -> str:
     """Assemble the final customer-facing system prompt.
 
     All callers must provide a tenant profile explicitly — there is no
     silent fallback.
     """
-    return _inject_date(MASTER_PROMPT_TEMPLATE, tenant_profile)
+    return _inject_date(MASTER_PROMPT_TEMPLATE, tenant_profile, customer_crm_context)
 
 
 def render_boss_prompt(tenant_profile: str) -> str:
@@ -280,170 +357,310 @@ def render_boss_prompt(tenant_profile: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_env(*names: str, default: str) -> str:
-    """Return the first non-empty env var found, or *default*."""
-    for name in names:
-        value = os.getenv(name, "").strip()
-        if value:
-            return value
-    return default
+def get_llm_backend(role: BackendRole = "agent") -> ResolvedBackend:
+    """Return the resolved backend configuration for the given role."""
+
+    return resolve_backend(role)
 
 
-def _require_env(env_var: str, message: str) -> str:
-    """Return a non-empty env var or raise RuntimeError."""
-    value = os.getenv(env_var, "").strip()
-    if not value:
-        raise RuntimeError(message)
-    return value
+def get_structured_output_strategy(
+    role: BackendRole = "agent",
+) -> StructuredOutputStrategy:
+    """Return the structured-output strategy for the configured backend."""
+
+    return get_llm_backend(role).capabilities.structured_output_strategy
 
 
-def _resolve_model_name(*env_names: str, model_name: str | None = None) -> str:
-    """Return the requested model name or the first configured env var.
+def _customer_output_type_for_strategy(strategy: StructuredOutputStrategy):
+    if strategy == "native":
+        return NativeOutput(
+            AgentTurn,
+            name="agent_turn",
+            description=(
+                "Return the next SMS turn. Use kind='dialog' while the "
+                "conversation is ongoing. Use kind='report' only when the "
+                "booking is complete."
+            ),
+            strict=True,
+        )
 
-    Raises RuntimeError if no model name is provided and no env var is set.
-    """
-    if model_name:
-        return model_name
-    for name in env_names:
-        value = os.getenv(name, "").strip()
-        if value:
-            return value
-    raise RuntimeError(f"No model configured. Set one of: {', '.join(env_names)}")
-
-
-def _build_provider(base_url: str, api_key: str) -> OpenRouterProvider | OpenAIProvider:
-    """Build the provider matching the configured base URL."""
-    if base_url == DEFAULT_OPENROUTER_BASE_URL.rstrip("/"):
-        return OpenRouterProvider(api_key=api_key)
-    return OpenAIProvider(base_url=base_url, api_key=api_key)
-
-
-def _model_name_from(model: object) -> str:
-    """Return a display-safe model name from a pydantic-ai model object."""
-    model_name = getattr(model, "model_name", None)
-    if model_name is not None:
-        return str(model_name)
-    return str(model)
+    return ToolOutput(
+        AgentTurn,
+        name="final_result",
+        description=(
+            "Return the next SMS turn. Use kind='dialog' while the conversation "
+            "is ongoing. Use kind='report' only when the booking is complete."
+        ),
+        strict=True,
+    )
 
 
-def build_model(model_name: str | None = None) -> OpenAIChatModel:
-    """Build an OpenAI-compatible chat model pointing at OpenRouter.
+def _boss_output_type_for_strategy(strategy: StructuredOutputStrategy):
+    if strategy == "native":
+        return NativeOutput(
+            BossReply,
+            name="boss_reply",
+            description="Return the next SMS reply to the boss.",
+            strict=True,
+        )
+
+    return ToolOutput(
+        BossReply,
+        name="boss_reply",
+        description="Return the next SMS reply to the boss.",
+        strict=True,
+    )
+
+
+def _build_model_from_backend(backend: ResolvedBackend) -> OpenAIChatModel:
+    provider = build_provider(backend.spec)
+    profile = build_model_profile(backend)
+    return OpenAIChatModel(
+        backend.spec.model_name,
+        provider=provider,
+        profile=profile,
+    )
+
+
+def build_model(
+    model_name: str | None = None,
+    *,
+    role: BackendRole = "agent",
+    provider: BackendProvider | None = None,
+) -> OpenAIChatModel:
+    """Build the configured model for the requested backend role.
 
     Raises:
-        RuntimeError: If OPENROUTER_API_KEY is not set, MONTFERRAND_MODEL is
-            not set (and no model_name override is provided), or model
-            construction fails.
+        RuntimeError: If the relevant API key is not set, no model is configured,
+            or model construction fails.
     """
-    base_url = _resolve_env(
-        "OPENROUTER_BASE_URL", default=DEFAULT_OPENROUTER_BASE_URL
-    ).rstrip("/")
-    api_key = _require_env(
-        "OPENROUTER_API_KEY",
-        "OPENROUTER_API_KEY is not set. "
-        "Copy .env.template to .env and fill in your key.",
-    )
-    name = _resolve_model_name("MONTFERRAND_MODEL", model_name=model_name)
+    backend = resolve_backend(role, model_name=model_name, provider=provider)
 
     try:
-        provider = _build_provider(base_url, api_key)
-        return OpenAIChatModel(name, provider=provider)
+        return _build_model_from_backend(backend)
     except Exception as exc:
-        raise RuntimeError(f"Failed to build model '{name}': {exc}") from exc
+        raise RuntimeError(
+            f"Failed to build model '{backend.spec.model_name}': {exc}"
+        ) from exc
 
 
 def build_judge_model() -> OpenAIChatModel:
     """Build the model used as LLM-judge in evals."""
-    name = _resolve_model_name(
-        "MONTFERRAND_JUDGE_MODEL",
-        "MONTFERRAND_MODEL",
+    return build_model(role="judge")
+
+
+# ---------------------------------------------------------------------------
+# Tool functions — each receives RunContext[AgentDeps] so calendar access is
+# automatically scoped to the injected tenant backend.
+# ---------------------------------------------------------------------------
+
+
+def _require_customer_phone(ctx: RunContext[AgentDeps]) -> str:
+    customer_phone = ctx.deps.customer_phone
+    if not customer_phone:
+        raise ValueError("Customer phone is not available in runtime context.")
+    return customer_phone
+
+
+def _require_customer_crm(ctx: RunContext[AgentDeps]) -> TenantCrmBackend:
+    crm = ctx.deps.crm
+    if crm is None:
+        raise ValueError("CRM backend is not available in runtime context.")
+    return crm
+
+
+def _conversation_id(ctx: RunContext[AgentDeps]) -> str:
+    return ctx.deps.conversation_id or ""
+
+
+async def tool_get_customer_context(
+    ctx: RunContext[AgentDeps],
+) -> CustomerContextResult:
+    """Look up CRM facts already known about this customer.
+
+    Use this when the customer seems to be returning, when you want to confirm
+    a saved name or address, or before implying you remember a prior visit.
+    """
+
+    return await _require_customer_crm(ctx).get_customer_context_by_phone(
+        _require_customer_phone(ctx)
     )
-    return build_model(name)
 
 
-# ---------------------------------------------------------------------------
-# Tool functions — each receives RunContext[AgentDeps] so the tenant's
-# calendar is automatically scoped.  The LLM never sees twilio_number.
-# ---------------------------------------------------------------------------
+async def tool_get_relevant_customer_history(
+    ctx: RunContext[AgentDeps],
+    issue_hint: str | None = None,
+    limit: int = 3,
+) -> CustomerHistoryResult:
+    """Look up recent CRM job history for this customer.
+
+    Use this when the customer says this is the same problem as before, refers
+    to a previous visit, or asks what happened last time.
+    """
+
+    return await _require_customer_crm(ctx).get_relevant_customer_history_by_phone(
+        _require_customer_phone(ctx),
+        issue_hint,
+        limit=limit,
+    )
 
 
-def tool_list_events(ctx: RunContext[AgentDeps], from_date: str, to_date: str) -> str:
-    """List all booked service calls in a date range.
+def tool_check_availability(
+    ctx: RunContext[AgentDeps],
+    from_date: str,
+    to_date: str,
+) -> AvailabilityResult:
+    """Return bookable service windows for customers.
 
-    You MUST call this tool BEFORE proposing any time slot to the customer.
+    You MUST call this tool BEFORE proposing any service window to the customer.
     Do not guess availability — always check the calendar first.
 
-    Returns a JSON array of booked events, or a message if none are found.
+    Returns a structured result with ``success``, ``message``, and ``windows``.
 
     Args:
         from_date: Start date in ISO format, e.g. '2026-03-16'.
         to_date: End date in ISO format, e.g. '2026-03-20'.
     """
-    return cal.list_events(ctx.deps.twilio_number, from_date, to_date)
+    return ctx.deps.calendar.list_available_windows(from_date, to_date)
 
 
-def tool_create_event(
+async def tool_create_service_call(
     ctx: RunContext[AgentDeps],
     date: str,
     start_time: str,
     end_time: str,
     summary: str,
-    description: str,
-) -> str:
-    """Book a new service call on the calendar.
+    customer_name: str,
+    service_location: str,
+    plumber_notes: str,
+) -> CalendarMutationResult:
+    """Book a new service call in a service window.
 
-    You MUST call this tool when the customer confirms a time slot,
-    BEFORE returning a Report.  A booking is not valid unless this tool
-    returns BOOKED.  You MUST NOT finalize a booking (return a Report)
-    without a successful BOOKED confirmation from this tool.
+    You MUST call this tool when the customer confirms a service window,
+    BEFORE returning a Report. A booking is not valid unless this tool
+    returns ``success=true`` with ``status='created'``. You MUST NOT
+    finalize a booking (return a Report) without that success.
 
-    If this tool returns CONFLICT, the slot is already taken — inform the
-    customer and propose an alternative time.
+    If this tool returns ``status='conflict'``, the slot is already taken —
+    inform the customer and propose an alternative time.
 
-    Returns 'BOOKED: ...' on success or 'CONFLICT: ...' if the slot overlaps.
+    Returns a structured result with ``success``, ``status``, ``message``,
+    and the booked or conflicting event when relevant.
 
     Args:
         date: Date in ISO format, e.g. '2026-03-16'.
-        start_time: Start time in HH:MM format, e.g. '09:00'.
-        end_time: End time in HH:MM format, e.g. '12:00'.
-        summary: Short label for the service call, e.g. 'Fuite sous evier - Jean Tremblay'.
-        description: Detailed description of the plumbing issue.
+        start_time: Service-window start time in HH:MM format, e.g. '09:00'.
+        end_time: Service-window end time in HH:MM format, e.g. '12:00'.
+        summary: Short label for the service call.
+        customer_name: Customer full name.
+        service_location: Full service address for the visit.
+        plumber_notes: Plumber-facing issue description and diagnostic context.
     """
-    return cal.create_event(
-        ctx.deps.twilio_number, date, start_time, end_time, summary, description
+    result = ctx.deps.calendar.create_service_call(
+        date,
+        start_time,
+        end_time,
+        summary,
+        customer_name,
+        _require_customer_phone(ctx),
+        service_location,
+        plumber_notes,
+    )
+    if not result.success or result.event is None:
+        return result
+
+    try:
+        customer = await _require_customer_crm(ctx).upsert_customer_for_phone(
+            _require_customer_phone(ctx),
+            customer_name,
+        )
+        location = await _require_customer_crm(
+            ctx
+        ).upsert_service_location_for_customer(
+            customer.customer_id,
+            service_location,
+        )
+        await _require_customer_crm(ctx).create_job_for_booking(
+            customer_id=customer.customer_id,
+            service_location_id=location.location_id,
+            conversation_id=_conversation_id(ctx),
+            calendar_uid=result.event.uid,
+            issue_summary=summary,
+            plumber_notes=plumber_notes,
+            scheduled_start=result.event.start_iso,
+            scheduled_end=result.event.end_iso,
+        )
+    except Exception:
+        rollback = ctx.deps.calendar.delete_event(result.event.uid)
+        if not rollback.success:
+            logger.exception(
+                "Failed to roll back calendar booking after CRM sync error: %s",
+                result.event.uid,
+            )
+        raise
+
+    return result
+
+
+def tool_list_own_bookings(
+    ctx: RunContext[AgentDeps],
+    from_date: str,
+    to_date: str,
+    include_past: bool = False,
+) -> ListEventsResult:
+    """List this customer's own bookings."""
+
+    return ctx.deps.calendar.list_customer_events(
+        _require_customer_phone(ctx),
+        from_date,
+        to_date,
+        include_past=include_past,
     )
 
 
-def tool_delete_event(ctx: RunContext[AgentDeps], uid: str) -> str:
-    """Cancel a booked service call.
+async def tool_cancel_own_booking(
+    ctx: RunContext[AgentDeps], uid: str
+) -> CalendarMutationResult:
+    """Cancel the current customer's own booked service call.
 
     Use this when the customer needs to cancel an existing appointment.
-    Call list_events first to find the UID of the event to cancel.
+    Call ``tool_list_own_bookings`` first to find the UID of the event.
 
-    Returns 'DELETED: ...' on success or 'ERROR: ...' if no event matches the UID.
+    Returns a structured result. Success is ``status='deleted'``.
 
     Args:
         uid: The unique identifier of the event to cancel.
     """
-    return cal.delete_event(ctx.deps.twilio_number, uid)
+    result = ctx.deps.calendar.delete_own_service_call(
+        uid, _require_customer_phone(ctx)
+    )
+    if result.success:
+        try:
+            await _require_customer_crm(ctx).mark_job_cancelled_by_calendar_uid(uid)
+        except Exception:
+            logger.exception("Failed to sync CRM cancellation for %s", uid)
+    return result
 
 
-def tool_modify_event(
+async def tool_modify_own_booking(
     ctx: RunContext[AgentDeps],
     uid: str,
     date: str | None = None,
     start_time: str | None = None,
     end_time: str | None = None,
     summary: str | None = None,
-    description: str | None = None,
-) -> str:
-    """Reschedule or update a booked service call.
+    customer_name: str | None = None,
+    service_location: str | None = None,
+    plumber_notes: str | None = None,
+) -> CalendarMutationResult:
+    """Reschedule or update the current customer's own service call.
 
     Use this when the customer needs to change the date, time, or details
-    of an existing appointment.  Call list_events first to find the UID.
+    of their existing appointment. Call ``tool_list_own_bookings`` first.
     Only non-null fields are updated; the rest keep their current values.
 
-    Returns 'UPDATED: ...' on success, 'CONFLICT: ...' if the new time
-    overlaps another booking, or 'ERROR: ...' if no event matches the UID.
+    Returns a structured result. Success is ``status='updated'``;
+    conflicts come back as ``status='conflict'``.
 
     Args:
         uid: The unique identifier of the event to modify.
@@ -451,11 +668,144 @@ def tool_modify_event(
         start_time: New start time in HH:MM, or null to keep current.
         end_time: New end time in HH:MM, or null to keep current.
         summary: New summary, or null to keep current.
-        description: New description, or null to keep current.
+        customer_name: New customer name, or null to keep current.
+        service_location: New service address, or null to keep current.
+        plumber_notes: New issue details, or null to keep current.
     """
-    return cal.modify_event(
-        ctx.deps.twilio_number, uid, date, start_time, end_time, summary, description
+    result = ctx.deps.calendar.modify_own_service_call(
+        uid,
+        _require_customer_phone(ctx),
+        date_str=date,
+        start_time=start_time,
+        end_time=end_time,
+        summary=summary,
+        customer_name=customer_name,
+        location=service_location,
+        plumber_notes=plumber_notes,
     )
+    if result.success and result.event is not None:
+        try:
+            await _require_customer_crm(ctx).sync_job_after_booking_modify(
+                calendar_uid=uid,
+                customer_name=result.event.customer_name,
+                service_location=result.event.location,
+                issue_summary=result.event.summary,
+                plumber_notes=result.event.plumber_notes,
+                scheduled_start=result.event.start_iso,
+                scheduled_end=result.event.end_iso,
+            )
+        except Exception:
+            logger.exception("Failed to sync CRM booking update for %s", uid)
+    return result
+
+
+def tool_list_schedule(
+    ctx: RunContext[AgentDeps],
+    from_date: str,
+    to_date: str,
+    include_past: bool = False,
+    recent_past_hours: int = 8,
+) -> ListEventsResult:
+    """List schedule events for boss operations.
+
+    Includes recently started or recently finished jobs by default so the boss
+    can see jobs that may still be in progress or running late.
+    """
+
+    return ctx.deps.calendar.list_events(
+        from_date,
+        to_date,
+        include_past=include_past,
+        recent_past_hours=recent_past_hours,
+    )
+
+
+def tool_block_time(
+    ctx: RunContext[AgentDeps],
+    date: str,
+    start_time: str,
+    end_time: str,
+    summary: str,
+    description: str = "",
+) -> CalendarMutationResult:
+    """Create a blocking event that removes customer availability."""
+
+    return ctx.deps.calendar.create_block(
+        date,
+        start_time,
+        end_time,
+        summary,
+        description,
+    )
+
+
+async def tool_delete_event(
+    ctx: RunContext[AgentDeps], uid: str
+) -> CalendarMutationResult:
+    """Boss-only deletion of an existing event by UID."""
+
+    result = ctx.deps.calendar.delete_event(uid)
+    if (
+        result.success
+        and result.event is not None
+        and result.event.event_kind == "service_call"
+    ):
+        crm = ctx.deps.crm
+        if crm is not None:
+            try:
+                await crm.mark_job_cancelled_by_calendar_uid(uid)
+            except Exception:
+                logger.exception("Failed to sync CRM deletion for %s", uid)
+    return result
+
+
+async def tool_modify_event(
+    ctx: RunContext[AgentDeps],
+    uid: str,
+    date: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    summary: str | None = None,
+    customer_name: str | None = None,
+    customer_phone: str | None = None,
+    service_location: str | None = None,
+    plumber_notes: str | None = None,
+    description: str | None = None,
+) -> CalendarMutationResult:
+    """Boss-only modification of any schedule event by UID."""
+
+    result = ctx.deps.calendar.modify_event(
+        uid,
+        date,
+        start_time,
+        end_time,
+        summary,
+        customer_name,
+        customer_phone,
+        service_location,
+        plumber_notes,
+        description,
+    )
+    if (
+        result.success
+        and result.event is not None
+        and result.event.event_kind == "service_call"
+    ):
+        crm = ctx.deps.crm
+        if crm is not None:
+            try:
+                await crm.sync_job_after_booking_modify(
+                    calendar_uid=uid,
+                    customer_name=result.event.customer_name,
+                    service_location=result.event.location,
+                    issue_summary=result.event.summary,
+                    plumber_notes=result.event.plumber_notes,
+                    scheduled_start=result.event.start_iso,
+                    scheduled_end=result.event.end_iso,
+                )
+            except Exception:
+                logger.exception("Failed to sync CRM boss update for %s", uid)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -465,64 +815,85 @@ def tool_modify_event(
 
 def build_agent(
     model: OpenAIChatModel | None = None,
-) -> Agent[AgentDeps, AgentOutput]:
+    *,
+    backend: ResolvedBackend | None = None,
+) -> Agent[AgentDeps, StructuredAgentOutput]:
     """Create a fresh booking agent with no static instructions.
 
     The tenant-specific system prompt is passed at run time via the
     ``instructions`` parameter of ``agent.run()``.
     """
+    resolved_backend = backend or resolve_backend("agent")
     return Agent(
         name="montferrand_agent",
-        model=model or build_model(),
+        model=model or _build_model_from_backend(resolved_backend),
         deps_type=AgentDeps,
-        output_type=AgentOutput,  # type: ignore[arg-type]
+        output_type=_customer_output_type_for_strategy(
+            resolved_backend.capabilities.structured_output_strategy
+        ),  # type: ignore[arg-type]
         tools=[
-            tool_list_events,
-            tool_create_event,
-            tool_delete_event,
-            tool_modify_event,
+            tool_get_customer_context,
+            tool_get_relevant_customer_history,
+            tool_check_availability,
+            tool_create_service_call,
+            tool_list_own_bookings,
+            tool_cancel_own_booking,
+            tool_modify_own_booking,
         ],
     )
 
 
-@lru_cache(maxsize=1)
-def get_agent() -> Agent[AgentDeps, AgentOutput]:
-    """Return a cached singleton customer-facing agent (stateless)."""
-    return build_agent()
+def get_agent() -> Agent[AgentDeps, StructuredAgentOutput]:
+    """Return a customer-facing agent for the current backend configuration."""
+
+    backend = resolve_backend("agent")
+    return build_agent(backend=backend)
 
 
 def build_boss_agent(
     model: OpenAIChatModel | None = None,
-) -> Agent[AgentDeps, AgentOutput]:
+    *,
+    backend: ResolvedBackend | None = None,
+) -> Agent[AgentDeps, BossOutput]:
     """Create a fresh boss/control-plane agent.
 
-    Uses the same tools as the customer agent but a different prompt
-    template (``BOSS_PROMPT_TEMPLATE``).  The prompt is injected at
-    runtime via the ``instructions`` parameter.
+    Uses a boss-specific tool surface and a different prompt template
+    (``BOSS_PROMPT_TEMPLATE``). The prompt is injected at runtime.
     """
+    resolved_backend = backend or resolve_backend("agent")
     return Agent(
         name="montferrand_boss_agent",
-        model=model or build_model(),
+        model=model or _build_model_from_backend(resolved_backend),
         deps_type=AgentDeps,
-        output_type=AgentOutput,  # type: ignore[arg-type]
+        output_type=_boss_output_type_for_strategy(
+            resolved_backend.capabilities.structured_output_strategy
+        ),  # type: ignore[arg-type]
         tools=[
-            tool_list_events,
-            tool_create_event,
+            tool_list_schedule,
+            tool_block_time,
             tool_delete_event,
             tool_modify_event,
         ],
     )
 
 
-@lru_cache(maxsize=1)
-def get_boss_agent() -> Agent[AgentDeps, AgentOutput]:
-    """Return a cached singleton boss agent (stateless)."""
-    return build_boss_agent()
+def get_boss_agent() -> Agent[AgentDeps, BossOutput]:
+    """Return a boss/control-plane agent for the current backend configuration."""
+
+    backend = resolve_backend("agent")
+    return build_boss_agent(backend=backend)
 
 
 def get_model_name() -> str:
-    """Return the model name from the cached agent."""
-    return _model_name_from(get_agent().model)
+    """Return the configured model name for the active agent backend."""
+
+    return resolve_backend("agent").spec.model_name
+
+
+def get_provider_name(role: BackendRole = "agent") -> str:
+    """Return the provider name for the requested backend role."""
+
+    return resolve_backend(role).spec.provider
 
 
 # ---------------------------------------------------------------------------

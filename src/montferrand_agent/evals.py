@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import date, timedelta
+from unittest.mock import patch
 
 import logfire
 
@@ -29,9 +32,9 @@ from pydantic_evals.evaluators import (
     Evaluator,
     EvaluatorContext,
     EvaluationReason,
-    HasMatchingSpan,
     LLMJudge,
 )
+from pydantic_evals.evaluators.llm_as_a_judge import judge_input_output
 from pydantic_evals.reporting import EvaluationReport
 from rich.console import Console
 from rich.table import Table
@@ -40,28 +43,39 @@ from rich.text import Text
 from montferrand_agent.agent import (
     DEMO_TENANT_PROFILE,
     build_judge_model,
-    get_agent,
     get_model_name,
+    render_prompt,
 )
-from montferrand_agent.calendar import reset_calendar
+from montferrand_agent.calendar import (
+    AvailabilityResult,
+    CalendarEvent,
+    CalendarMutationResult,
+    ListEventsResult,
+    get_tenant_calendar,
+    reset_calendar,
+)
 from montferrand_agent.conversation import (
     ConversationError,
+    _run_agent,
     new_conversation_id,
     process_message,
     reset,
 )
+from montferrand_agent.crm import provision_tenant_crm
 from montferrand_agent.customer import (
     CustomerAgentError,
     build_customer_agent,
     customer_reply,
 )
 from montferrand_agent.models import Dialog, Report
+from montferrand_agent.tool_use_fixtures import TOOL_USE_FIXTURES, ToolUseFixture
 
 # Phone number used to scope eval conversation files on disk.
 # This is NOT a real Twilio number — it's a fixed sentinel so evals
 # always write to the same tenant subdirectory, which is separate
 # from any real tenant's data.
 _EVAL_TENANT_NUMBER = "+10000000000"
+_EVAL_CUSTOMER_NUMBER = "+15550000002"
 
 Actor = str
 
@@ -81,11 +95,13 @@ GRID_MODEL_TIMEOUT = 300.0
 
 # Models to sweep in --grid mode, ordered cheapest to most expensive.
 GRID_MODELS = [
-    "google/gemini-3-flash-preview",
-    "deepseek/deepseek-v3.2",
-    "moonshotai/kimi-k2.5",
-    "x-ai/grok-4.1-fast",
-    "anthropic/claude-sonnet-4.6",
+    "inception/mercury-2",
+    "qwen/qwen3.5-35b-a3b",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "google/gemini-3.1-pro-preview",
+    "mistralai/mistral-small-2603",
+    "xiaomi/mimo-v2-pro",
+    "openai/gpt-5.4-mini",
 ]
 
 # ---------------------------------------------------------------------------
@@ -112,8 +128,13 @@ RUBRIC_DIAGNOSTIC_EXPERTISE = (
 
 RUBRIC_PROACTIVE_PROPOSAL = (
     _RUBRIC_PREAMBLE + "Evaluate ONLY whether:\n"
-    "1. The agent proactively offers a price range AND an "
-    "appointment slot.\n"
+    "1. The agent proactively offers a price range AND appointment "
+    "slots. Critically, the agent must NOT state the pricing and then "
+    "passively wait for the customer to acknowledge or ask about "
+    "booking. When the agent shares its assessment and pricing, it "
+    "should transition to proposing service windows in the same "
+    "message or immediately in the next one — without requiring the "
+    "customer to say 'ok' or ask for availability first.\n"
     "2. The agent collects personal info (name, address, etc.) only "
     "AFTER demonstrating competence — not as the first questions.\n"
     "Pass if BOTH are met."
@@ -173,6 +194,17 @@ RUBRIC_PLAIN_LANGUAGE = (
     "understand. Pass if no unexplained jargon is used."
 )
 
+RUBRIC_EXPLICIT_BOOKING_DATES = (
+    _RUBRIC_PREAMBLE
+    + "Evaluate ONLY whether every date proposed or confirmed for booking is unambiguous. "
+    "Specifically:\n"
+    "- Whenever the agent proposes, compares, or confirms appointment windows, the customer must be able to tell the exact calendar date.\n"
+    "- The agent should include day, month, and year at least once for the booking date being discussed.\n"
+    "- It is acceptable to mention the full date once and then list multiple service windows for that same day.\n"
+    "- Fail if the agent asks the customer to choose a slot using only ambiguous terms like 'vendredi', 'demain', or 'la semaine prochaine' without making the actual calendar date clear.\n"
+    "Pass if all proposed or confirmed booking dates in the whole conversation are explicit and unambiguous."
+)
+
 RUBRIC_PHYSICALLY_OBSERVABLE = (
     _RUBRIC_PREAMBLE + "Evaluate ONLY whether every question the agent asks "
     "refers to something the customer can physically observe without tools, "
@@ -190,6 +222,57 @@ RUBRIC_PHYSICALLY_OBSERVABLE = (
     "without any impossible action."
 )
 
+RUBRIC_MULTI_DATE_OFFER = (
+    _RUBRIC_PREAMBLE + "Evaluate ONLY whether the agent offers multiple date "
+    "options when proposing availability and encourages the customer to ask "
+    "for alternatives. Specifically:\n"
+    "- When the agent first proposes service windows, it should present at "
+    "least 2 different dates or days (not just one date with morning/afternoon "
+    "on the same day).\n"
+    "- After listing the options, the agent should explicitly invite the "
+    "customer to ask for other dates if none of the proposed options work "
+    "(e.g., 'si aucune de ces plages ne vous convient, dites-le-moi').\n"
+    "- The goal is that the customer never feels the proposed dates are "
+    "take-it-or-leave-it. The agent should make it clear that more "
+    "options are available.\n"
+    "Pass if BOTH conditions are met when the agent first proposes availability."
+)
+
+RUBRIC_COMPLETE_ADDRESS = (
+    _RUBRIC_PREAMBLE + "Evaluate ONLY whether the agent collects a complete "
+    "service address before finalizing the booking. A complete address must "
+    "include at minimum: street number, street name, and city.\n"
+    "- If the customer gives only a partial address (e.g., just '789 "
+    "Louis-Hebert' without a city), the agent MUST ask for the missing "
+    "parts before booking.\n"
+    "- The agent should not accept an address that is missing the city.\n"
+    "- Postal code is a nice-to-have; the agent may ask for it but it is "
+    "not strictly required for a pass.\n"
+    "- Look at the final booking confirmation and the address passed to "
+    "the booking tool: it must contain at least street number, street "
+    "name, and city.\n"
+    "Pass if the confirmed address includes at least street number, "
+    "street name, and city."
+)
+
+RUBRIC_NO_ASSUMED_HISTORY = (
+    _RUBRIC_PREAMBLE + "Evaluate ONLY whether the agent correctly handles "
+    "references to past interactions it has no memory of. Specifically:\n"
+    "- If the customer refers to a previous visit, past problem, or past "
+    "conversation (e.g., 'le meme probleme que la derniere fois', "
+    "'comme la derniere fois', 'vous etes deja venu'), the agent must "
+    "NOT play along or pretend to remember.\n"
+    "- The agent must NOT fabricate details about a past visit, guess "
+    "what the previous problem was, or offer a hypothesis based on an "
+    "imagined prior interaction.\n"
+    "- The correct behavior is to acknowledge that it does not have "
+    "access to previous interactions and politely ask the customer to "
+    "describe the current problem.\n"
+    "- If the customer never references past interactions, this rubric "
+    "passes automatically.\n"
+    "Pass if the agent never fabricates or assumes prior history."
+)
+
 # Ordered list of (rubric, evaluation_name) for building evaluators.
 _RUBRICS = [
     (RUBRIC_DIAGNOSTIC_EXPERTISE, "diagnostic_expertise"),
@@ -200,7 +283,11 @@ _RUBRICS = [
     (RUBRIC_REALISTIC_QUESTIONS, "realistic_questions"),
     (RUBRIC_PRELIMINARY_FRAMING, "preliminary_framing"),
     (RUBRIC_PLAIN_LANGUAGE, "plain_language"),
+    (RUBRIC_EXPLICIT_BOOKING_DATES, "explicit_booking_dates"),
     (RUBRIC_PHYSICALLY_OBSERVABLE, "physically_observable"),
+    (RUBRIC_MULTI_DATE_OFFER, "multi_date_offer"),
+    (RUBRIC_COMPLETE_ADDRESS, "complete_address"),
+    (RUBRIC_NO_ASSUMED_HISTORY, "no_assumed_history"),
 ]
 
 # Display names for the report table columns.
@@ -214,10 +301,12 @@ _EVAL_DISPLAY_NAMES: dict[str, str] = {
     "realistic_questions": "Questions",
     "preliminary_framing": "Preliminary",
     "plain_language": "Plain Lang.",
+    "explicit_booking_dates": "Dates",
     "NoSlowTurns": "Speed",
     "physically_observable": "Physical",
-    "UsedListEvents": "List Evts",
-    "UsedCreateEvent": "Create Evt",
+    "multi_date_offer": "Multi-Date",
+    "complete_address": "Address",
+    "no_assumed_history": "No History",
 }
 
 
@@ -259,6 +348,220 @@ class ConversationResult:
 
     turn_durations: list[float] = field(default_factory=list)
     """Wall-clock seconds per agent turn."""
+
+
+@dataclass(frozen=True)
+class ToolUseCall:
+    """A single tool call captured during a fixed tool-use smoke."""
+
+    name: str
+    args: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ToolUseSmokeResult:
+    """Outcome of a deterministic one-turn tool-use smoke."""
+
+    fixture_name: str
+    expected_tool_name: str
+    expected_location: str
+    calls: list[ToolUseCall]
+    output_kind: str | None
+    output_message: str | None
+    error: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        if self.error:
+            return False
+        for call in self.calls:
+            if call.name != self.expected_tool_name:
+                continue
+            if not self.expected_location:
+                return True
+            if call.args.get("location") == self.expected_location:
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class BossEvalResult:
+    """Outcome of a boss-specific eval smoke."""
+
+    scenario_name: str
+    input_message: str
+    output_message: str | None
+    passed: bool
+    judge_reason: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class _RecordingCalendarBackend:
+    """Minimal calendar backend used to capture tool calls during smokes."""
+
+    calls: list[ToolUseCall] = field(default_factory=list)
+
+    def list_events(self, from_date: str, to_date: str) -> ListEventsResult:
+        del from_date, to_date
+        return ListEventsResult(
+            success=True,
+            message="No events found in this date range.",
+            events=[],
+        )
+
+    def list_available_windows(
+        self, from_date: str, to_date: str
+    ) -> AvailabilityResult:
+        self.calls.append(
+            ToolUseCall(
+                name="tool_check_availability",
+                args={"from_date": from_date, "to_date": to_date},
+            )
+        )
+        return AvailabilityResult(
+            success=True,
+            message="Found 1 available service window(s).",
+            windows=[],
+        )
+
+    def create_service_call(
+        self,
+        date_str: str,
+        start_time: str,
+        end_time: str,
+        summary: str,
+        customer_name: str,
+        customer_phone: str,
+        location: str,
+        plumber_notes: str,
+    ) -> CalendarMutationResult:
+        args = {
+            "date": date_str,
+            "start_time": start_time,
+            "end_time": end_time,
+            "summary": summary,
+            "customer_name": customer_name,
+            "customer_phone": customer_phone,
+            "location": location,
+            "plumber_notes": plumber_notes,
+        }
+        self.calls.append(ToolUseCall(name="tool_create_service_call", args=args))
+        return CalendarMutationResult(
+            success=True,
+            status="created",
+            message="Recorded create_service_call call.",
+            event=CalendarEvent(
+                uid="fixture-event",
+                start_iso=f"{date_str}T{start_time}:00-04:00",
+                end_iso=f"{date_str}T{end_time}:00-04:00",
+                event_kind="service_call",
+                summary=summary,
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                location=location,
+                plumber_notes=plumber_notes,
+                description=plumber_notes,
+            ),
+        )
+
+    def create_block(
+        self,
+        date_str: str,
+        start_time: str,
+        end_time: str,
+        summary: str,
+        description: str = "",
+    ) -> CalendarMutationResult:
+        args = {
+            "date": date_str,
+            "start_time": start_time,
+            "end_time": end_time,
+            "summary": summary,
+            "description": description,
+        }
+        self.calls.append(ToolUseCall(name="tool_block_time", args=args))
+        return CalendarMutationResult(
+            success=True,
+            status="created",
+            message="Recorded block call.",
+            event=CalendarEvent(
+                uid="fixture-block",
+                start_iso=f"{date_str}T{start_time}:00-04:00",
+                end_iso=f"{date_str}T{end_time}:00-04:00",
+                event_kind="block",
+                summary=summary,
+                description=description,
+            ),
+        )
+
+    def delete_event(self, uid: str) -> CalendarMutationResult:
+        self.calls.append(ToolUseCall(name="tool_delete_event", args={"uid": uid}))
+        return CalendarMutationResult(
+            success=False,
+            status="not_found",
+            message="No event found with that UID.",
+        )
+
+    def modify_event(
+        self,
+        uid: str,
+        date_str: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        summary: str | None = None,
+        customer_name: str | None = None,
+        customer_phone: str | None = None,
+        location: str | None = None,
+        plumber_notes: str | None = None,
+        description: str | None = None,
+    ) -> CalendarMutationResult:
+        args = {
+            "uid": uid,
+            "date": date_str or "",
+            "start_time": start_time or "",
+            "end_time": end_time or "",
+            "summary": summary or "",
+            "customer_name": customer_name or "",
+            "customer_phone": customer_phone or "",
+            "location": location or "",
+            "plumber_notes": plumber_notes or "",
+            "description": description or "",
+        }
+        self.calls.append(ToolUseCall(name="tool_modify_event", args=args))
+        return CalendarMutationResult(
+            success=False,
+            status="not_found",
+            message="No event found with that UID.",
+        )
+
+    def list_customer_events(
+        self,
+        customer_phone: str,
+        from_date: str,
+        to_date: str,
+        *,
+        include_past: bool = False,
+        recent_past_hours: int = 0,
+    ) -> ListEventsResult:
+        del customer_phone, from_date, to_date, include_past, recent_past_hours
+        return ListEventsResult(success=True, message="ok", events=[])
+
+    def modify_own_service_call(self, *args, **kwargs) -> CalendarMutationResult:
+        del args, kwargs
+        return CalendarMutationResult(
+            success=False,
+            status="not_found",
+            message="No event found with that UID.",
+        )
+
+    def delete_own_service_call(self, *args, **kwargs) -> CalendarMutationResult:
+        del args, kwargs
+        return CalendarMutationResult(
+            success=False,
+            status="not_found",
+            message="No event found with that UID.",
+        )
 
 
 def _result(
@@ -323,11 +626,13 @@ async def _run_agent_turn(
     """Run one booking-agent turn, returning (output, duration, failure)."""
     t0 = time.perf_counter()
     try:
+        provision_tenant_crm(_EVAL_TENANT_NUMBER)
         agent_output = await process_message(
             conversation_id,
             customer_message,
             tenant_profile=DEMO_TENANT_PROFILE,
             twilio_number=_EVAL_TENANT_NUMBER,
+            customer_phone=_EVAL_CUSTOMER_NUMBER,
         )
     except ConversationError as exc:
         duration = time.perf_counter() - t0
@@ -415,6 +720,237 @@ async def run_scenario(scenario: Scenario) -> ConversationResult:
     finally:
         reset(conversation_id, _EVAL_TENANT_NUMBER)
         reset_calendar(_EVAL_TENANT_NUMBER)
+
+
+async def run_tool_use_fixture(fixture: ToolUseFixture) -> ToolUseSmokeResult:
+    """Run one deterministic booking-turn fixture and capture tool calls."""
+
+    backend = _RecordingCalendarBackend()
+    provision_tenant_crm(_EVAL_TENANT_NUMBER)
+    instructions = render_prompt(DEMO_TENANT_PROFILE)
+
+    with patch(
+        "montferrand_agent.conversation.get_tenant_calendar",
+        return_value=backend,
+    ):
+        try:
+            result = await _run_agent(
+                fixture.latest_user_message,
+                fixture.history,
+                instructions,
+                _EVAL_TENANT_NUMBER,
+                customer_phone=_EVAL_CUSTOMER_NUMBER,
+            )
+        except ConversationError as exc:
+            return ToolUseSmokeResult(
+                fixture_name=fixture.name,
+                expected_tool_name=fixture.expected_tool_name,
+                expected_location=fixture.expected_location,
+                calls=backend.calls,
+                output_kind=None,
+                output_message=None,
+                error=str(exc),
+            )
+
+    output = result.output
+    output_kind = getattr(output, "kind", None)
+    output_message = getattr(output, "message", None)
+    return ToolUseSmokeResult(
+        fixture_name=fixture.name,
+        expected_tool_name=fixture.expected_tool_name,
+        expected_location=fixture.expected_location,
+        calls=backend.calls,
+        output_kind=output_kind,
+        output_message=output_message,
+    )
+
+
+def _next_weekday(start: date, weekday: int) -> date:
+    """Return the next future date matching the given weekday."""
+
+    days_ahead = (weekday - start.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return start + timedelta(days=days_ahead)
+
+
+async def run_blocked_day_smoke() -> ToolUseSmokeResult:
+    """Smoke-test that a boss-created block removes customer availability."""
+
+    target_date = _next_weekday(date.today(), 4)
+    target_iso = target_date.isoformat()
+    boss_trace: list[tuple[str, str | None, str]] = []
+    customer_trace: list[tuple[str, str | None, str]] = []
+
+    def boss_observer(event):
+        boss_trace.append((event.kind, event.tool_name, event.summary))
+
+    def customer_observer(event):
+        customer_trace.append((event.kind, event.tool_name, event.summary))
+
+    with (
+        tempfile.TemporaryDirectory() as td,
+        patch.dict(
+            os.environ,
+            {"MONTFERRAND_DATA_DIR": td},
+            clear=False,
+        ),
+    ):
+        provision_tenant_crm(_EVAL_TENANT_NUMBER)
+        await process_message(
+            new_conversation_id(),
+            f"Bloque le {target_iso} de 9h a 17h pour conge.",
+            tenant_profile=DEMO_TENANT_PROFILE,
+            twilio_number=_EVAL_TENANT_NUMBER,
+            is_boss=True,
+            trace_observer=boss_observer,
+        )
+
+        customer_result = await process_message(
+            new_conversation_id(),
+            f"Avez-vous de la place le {target_iso}?",
+            tenant_profile=DEMO_TENANT_PROFILE,
+            twilio_number=_EVAL_TENANT_NUMBER,
+            customer_phone=_EVAL_CUSTOMER_NUMBER,
+            trace_observer=customer_observer,
+        )
+
+    calls: list[ToolUseCall] = []
+    if any(
+        tool_name == "tool_check_availability"
+        for kind, tool_name, _ in customer_trace
+        if kind == "tool_called"
+    ):
+        calls.append(
+            ToolUseCall(name="tool_check_availability", args={"date": target_iso})
+        )
+    if any(
+        tool_name == "tool_block_time"
+        for kind, tool_name, _ in boss_trace
+        if kind == "tool_called"
+    ):
+        calls.append(ToolUseCall(name="tool_block_time", args={"date": target_iso}))
+
+    error_reasons: list[str] = []
+    if not any(
+        tool_name == "tool_block_time"
+        for kind, tool_name, _ in boss_trace
+        if kind == "tool_called"
+    ):
+        error_reasons.append("boss did not call tool_block_time")
+    if not any(
+        tool_name == "tool_check_availability"
+        for kind, tool_name, _ in customer_trace
+        if kind == "tool_called"
+    ):
+        error_reasons.append("customer did not call tool_check_availability")
+
+    if not error_reasons:
+        grading = await judge_input_output(
+            inputs={
+                "customer_request": f"Avez-vous de la place le {target_iso}?",
+                "availability_tool_result": "No available service windows found in this date range.",
+            },
+            output=customer_result.message,
+            rubric=(
+                "The reply clearly says there is no availability on the requested date "
+                "and does not propose or imply any bookable service window on that date. "
+                "It may ask a follow-up question about another day or about the plumbing problem."
+            ),
+            model=build_judge_model(),
+        )
+        if not grading.pass_:
+            error_reasons.append(f"judge rejected blocked-day reply: {grading.reason}")
+
+    return ToolUseSmokeResult(
+        fixture_name="blocked_day_prevents_customer_availability",
+        expected_tool_name="tool_check_availability",
+        expected_location="",
+        calls=calls,
+        output_kind="dialog",
+        output_message=customer_result.message,
+        error="; ".join(error_reasons) if error_reasons else None,
+    )
+
+
+async def run_boss_french_language_eval() -> BossEvalResult:
+    """Check that the boss agent stays in French with a French-speaking boss."""
+
+    target_date = _next_weekday(date.today(), 3)
+    target_iso = target_date.isoformat()
+    boss_message = f"Qu'est-ce que j'ai le {target_iso}?"
+
+    with (
+        tempfile.TemporaryDirectory() as td,
+        patch.dict(
+            os.environ,
+            {"MONTFERRAND_DATA_DIR": td},
+            clear=False,
+        ),
+    ):
+        provision_tenant_crm(_EVAL_TENANT_NUMBER)
+        backend = get_tenant_calendar(_EVAL_TENANT_NUMBER)
+        backend.create_service_call(
+            target_iso,
+            "09:00",
+            "12:00",
+            "Inspection fuite sous évier",
+            "Jean Tremblay",
+            _EVAL_CUSTOMER_NUMBER,
+            "123 rue Test, Longueuil, J4K 1A1",
+            "Fuite sous l’évier de cuisine, surtout à l’ouverture du robinet.",
+        )
+
+        try:
+            boss_result = await process_message(
+                new_conversation_id(),
+                boss_message,
+                tenant_profile=DEMO_TENANT_PROFILE,
+                twilio_number=_EVAL_TENANT_NUMBER,
+                is_boss=True,
+            )
+        except ConversationError as exc:
+            return BossEvalResult(
+                scenario_name="boss_french_language_match",
+                input_message=boss_message,
+                output_message=None,
+                passed=False,
+                error=str(exc),
+            )
+
+    grading = await judge_input_output(
+        inputs={"boss_message": boss_message},
+        output=boss_result.message,
+        rubric=(
+            "The boss message is in French. The assistant reply must also be fully in French, "
+            "must not switch to English, and must not mix French and English in the same reply. "
+            "It should answer the boss operationally."
+        ),
+        model=build_judge_model(),
+    )
+
+    return BossEvalResult(
+        scenario_name="boss_french_language_match",
+        input_message=boss_message,
+        output_message=boss_result.message,
+        passed=grading.pass_,
+        judge_reason=grading.reason,
+        error=None if grading.pass_ else grading.reason,
+    )
+
+
+async def run_boss_smokes() -> list[BossEvalResult]:
+    """Run all boss-specific eval smokes."""
+
+    return [await run_boss_french_language_eval()]
+
+
+async def run_tool_use_smokes() -> list[ToolUseSmokeResult]:
+    """Run all fixed tool-use fixtures for the active model."""
+
+    results = [await run_tool_use_fixture(fixture) for fixture in TOOL_USE_FIXTURES]
+    results.append(await run_blocked_day_smoke())
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -507,11 +1043,25 @@ est apparu graduellement. Tu es disponible cette semaine. Tu es cooperatif
 et patient. Tu ecris en francais, normalement.""",
 )
 
+RETURNING_CUSTOMER = Scenario(
+    persona="""\
+Tu es Robert Lavoie. Tu habites au 55 rue des Pins, Greenfield Park, J4V 1A2.
+Tu as DEJA appele cette compagnie de plomberie il y a quelques mois pour un
+probleme de drain au sous-sol. Tu commences la conversation en disant que tu
+as le meme probleme que la derniere fois, comme si l'agent devait se souvenir
+de toi. En realite, ton drain de sous-sol est encore bloque, l'eau ne coule
+plus du tout, et tu vois de l'eau stagnante autour du drain. Il n'y a pas
+d'odeur. Les autres drains de la maison fonctionnent. Tu es disponible
+n'importe quand cette semaine. Tu es un peu impatient parce que le probleme
+revient. Tu ecris en francais, de facon directe et un peu bourrue.""",
+)
+
 SCENARIOS = {
     "simple_booking": SIMPLE_BOOKING,
     "urgent_overflow": URGENT_OVERFLOW,
     "ambiguous_drain": AMBIGUOUS_DRAIN,
     "kitchen_odor": KITCHEN_ODOR,
+    "returning_customer": RETURNING_CUSTOMER,
 }
 
 # ---------------------------------------------------------------------------
@@ -543,25 +1093,6 @@ def build_dataset() -> Dataset[Scenario, ConversationResult, None]:
     evaluators = [
         ConversationConverged(),
         NoSlowTurns(),
-        # Span-based: verify the agent used calendar tools
-        HasMatchingSpan(
-            query={
-                "and_": [
-                    {"name_equals": "running tool"},
-                    {"has_attributes": {"gen_ai.tool.name": "tool_list_events"}},
-                ]
-            },
-            evaluation_name="UsedListEvents",
-        ),
-        HasMatchingSpan(
-            query={
-                "and_": [
-                    {"name_equals": "running tool"},
-                    {"has_attributes": {"gen_ai.tool.name": "tool_create_event"}},
-                ]
-            },
-            evaluation_name="UsedCreateEvent",
-        ),
         *_build_judge_evaluators(),
     ]
 
@@ -700,6 +1231,65 @@ def _print_failure_details(
     console.print(table)
 
 
+def print_tool_use_report(results: list[ToolUseSmokeResult]) -> None:
+    """Render the deterministic tool-use smoke results."""
+
+    console = Console()
+    console.print()
+    console.print("[bold]Tool Use Smokes[/bold]")
+
+    table = Table(show_lines=True, padding=(0, 1))
+    table.add_column("Fixture", style="bold")
+    table.add_column("Expected Tool", no_wrap=True)
+    table.add_column("Observed Tool", no_wrap=True)
+    table.add_column("Location", max_width=40)
+    table.add_column("Status", justify="center")
+    table.add_column("Output", max_width=60)
+
+    for result in results:
+        first_call = result.calls[0] if result.calls else None
+        observed_tool = first_call.name if first_call else "-"
+        location = first_call.args.get("location", "-") if first_call else "-"
+        if result.error:
+            output = f"ERROR: {result.error}"
+        else:
+            output = f"{result.output_kind or '-'}: {result.output_message or ''}"
+        table.add_row(
+            result.fixture_name,
+            result.expected_tool_name,
+            observed_tool,
+            location,
+            _pass_fail(result.passed),
+            output,
+        )
+
+    console.print(table)
+
+
+def print_boss_eval_report(results: list[BossEvalResult]) -> None:
+    """Render boss-specific eval smoke results."""
+
+    console = Console()
+    console.print()
+    console.print("[bold]Boss Evals[/bold]")
+
+    table = Table(show_lines=True, padding=(0, 1))
+    table.add_column("Scenario", style="bold")
+    table.add_column("Status", justify="center")
+    table.add_column("Output", max_width=70)
+    table.add_column("Reason", max_width=80)
+
+    for result in results:
+        table.add_row(
+            result.scenario_name,
+            _pass_fail(result.passed),
+            result.output_message or "-",
+            result.error or result.judge_reason or "",
+        )
+
+    console.print(table)
+
+
 # ---------------------------------------------------------------------------
 # Report rendering — grid search
 # ---------------------------------------------------------------------------
@@ -832,9 +1422,9 @@ async def run_grid(
         console.print(
             f"\n[bold][{i}/{len(GRID_MODELS)}] {model_name}[/bold]",
         )
-        # Swap the active model by setting the env var and clearing the cache
+        # Swap the active model by setting the env var.
+        # Agent instances are rebuilt from environment on each call.
         os.environ["MONTFERRAND_MODEL"] = model_name
-        get_agent.cache_clear()
 
         dataset = build_dataset()
         try:
@@ -860,14 +1450,30 @@ async def run_grid(
 # ---------------------------------------------------------------------------
 
 
-def main(model_name: str | None = None) -> None:
-    """Run the eval suite for a single model and print results."""
+async def _run_main(model_name: str | None = None):
+    """Run dataset evals, tool-use smokes, and boss smokes in one event loop."""
+
     if model_name:
         os.environ["MONTFERRAND_MODEL"] = model_name
-        get_agent.cache_clear()
 
-    report = asyncio.run(build_dataset().evaluate(run_scenario))
+    report = await build_dataset().evaluate(run_scenario)
+    tool_use_results = await run_tool_use_smokes()
+    boss_results = await run_boss_smokes()
+    return report, tool_use_results, boss_results
+
+
+def main(model_name: str | None = None) -> None:
+    """Run the eval suite for a single model and print results."""
+    report, tool_use_results, boss_results = asyncio.run(
+        _run_main(model_name=model_name)
+    )
     print_report(report, model_name=model_name)
+    print_tool_use_report(tool_use_results)
+    print_boss_eval_report(boss_results)
+    if any(not result.passed for result in tool_use_results) or any(
+        not result.passed for result in boss_results
+    ):
+        raise SystemExit(1)
 
 
 def main_grid(model_timeout: float = GRID_MODEL_TIMEOUT) -> None:

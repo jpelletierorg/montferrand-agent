@@ -11,6 +11,10 @@ Directory layout::
         tenants/          # tenant config .txt files
         conversations/    # NDJSON conversation histories
         calendars/        # vdir .ics event files
+        tenant/
+            db/
+                <tenant_hash>/
+                    crm.sqlite3
 """
 
 from __future__ import annotations
@@ -48,3 +52,18 @@ def conversations_dir() -> Path:
 def calendars_dir() -> Path:
     """Return the directory for calendar vdir files."""
     return _require_data_dir() / "calendars"
+
+
+def tenant_db_root_dir() -> Path:
+    """Return the root directory for tenant-scoped databases."""
+    return _require_data_dir() / "tenant" / "db"
+
+
+def ops_dir() -> Path:
+    """Return the directory for operations and observability data."""
+    return _require_data_dir() / "ops"
+
+
+def ops_db_path() -> Path:
+    """Return the SQLite path for the ops event store."""
+    return ops_dir() / "ops.sqlite3"

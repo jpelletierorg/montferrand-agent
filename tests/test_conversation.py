@@ -5,6 +5,8 @@ All tests are pure logic — no LLM calls.
 
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic_ai import BinaryContent
@@ -18,15 +20,19 @@ from montferrand_agent.conversation import (
     _get_history,
     _load_history_from_disk,
     _read_image,
+    _run_agent,
     _save_history,
     _tenant_data_dir,
     conversation_key_for_sms,
     get_cost,
     list_conversations,
     new_conversation_id,
+    process_message,
     reset,
     reset_tenant,
 )
+from montferrand_agent.crm import get_tenant_crm, provision_tenant_crm
+from montferrand_agent.models import AgentTurn, Dialog, Report
 
 from .conftest import CUSTOMER_NUMBER, TWILIO_NUMBER, assert_hex_string
 
@@ -372,6 +378,103 @@ class TestResetTenant:
 
         assert "conv_mem" not in _histories
         assert "conv_mem" not in _costs
+
+
+class TestProcessMessageReturnTypes:
+    @pytest.fixture(autouse=True)
+    def _isolate_data_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        monkeypatch.setenv("MONTFERRAND_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("MONTFERRAND_TIMEZONE", "America/Montreal")
+
+    @pytest.mark.asyncio
+    async def test_process_message_converts_dialog_turn(self):
+        fake_result = SimpleNamespace(
+            output=AgentTurn(kind="dialog", message="Bonjour"),
+            all_messages=lambda: [],
+            usage=lambda: RunUsage(),
+        )
+
+        with patch(
+            "montferrand_agent.conversation._run_agent",
+            AsyncMock(return_value=fake_result),
+        ):
+            result = await process_message(
+                "conv_dialog",
+                "hello",
+                tenant_profile="You are a plumber.",
+                twilio_number=_TN,
+            )
+
+        assert result == Dialog(message="Bonjour")
+
+    @pytest.mark.asyncio
+    async def test_process_message_converts_report_turn(self):
+        fake_result = SimpleNamespace(
+            output=AgentTurn(
+                kind="report",
+                message="C'est reserve.",
+                customer_name="Jean Tremblay",
+                service_location="123 rue Test",
+                issue_description="Drain bouche dans le garage.",
+                appointment_window="demain 9h a 12h",
+            ),
+            all_messages=lambda: [],
+            usage=lambda: RunUsage(),
+        )
+
+        with patch(
+            "montferrand_agent.conversation._run_agent",
+            AsyncMock(return_value=fake_result),
+        ):
+            result = await process_message(
+                "conv_report",
+                "hello",
+                tenant_profile="You are a plumber.",
+                twilio_number=_TN,
+            )
+
+        assert result == Report(
+            message="C'est reserve.",
+            customer_name="Jean Tremblay",
+            service_location="123 rue Test",
+            issue_description="Drain bouche dans le garage.",
+            appointment_window="demain 9h a 12h",
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_message_injects_crm_context_into_instructions(
+        self, fake_dbmate
+    ):
+        fake_result = SimpleNamespace(
+            output=AgentTurn(kind="dialog", message="Bonjour"),
+            all_messages=lambda: [],
+            usage=lambda: RunUsage(),
+        )
+        provision_tenant_crm(_TN)
+        crm = get_tenant_crm(_TN)
+        customer = await crm.upsert_customer_for_phone(
+            "+14381112222", "Jonathan Pelletier"
+        )
+        await crm.upsert_service_location_for_customer(
+            customer.customer_id,
+            "123 rue Test, Longueuil, J4K 1A1",
+        )
+
+        with patch(
+            "montferrand_agent.conversation._run_agent",
+            AsyncMock(return_value=fake_result),
+        ) as mock_run:
+            await process_message(
+                "conv_crm",
+                "hello",
+                tenant_profile="You are a plumber.",
+                twilio_number=_TN,
+                customer_phone="+14381112222",
+            )
+
+        instructions = mock_run.call_args.args[2]
+        assert "Known customer name: Jonathan Pelletier" in instructions
+        assert "123 rue Test, Longueuil, J4K 1A1" in instructions
 
 
 # ---------------------------------------------------------------------------

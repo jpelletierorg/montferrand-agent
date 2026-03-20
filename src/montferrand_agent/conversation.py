@@ -24,15 +24,26 @@ import hashlib
 import logging
 import mimetypes
 import shutil
+import time
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Sequence, Union
+from typing import Any, Callable, Literal, Sequence, Union, cast
 
 import pydantic
+from pydantic_graph import End
+from pydantic_ai._agent_graph import CallToolsNode, ModelRequestNode, UserPromptNode
 from pydantic_ai import BinaryContent, UserContent
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    ModelMessage,
+    ModelResponse,
+    RetryPromptPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.usage import RunUsage
 
 logger = logging.getLogger(__name__)
@@ -45,13 +56,119 @@ from montferrand_agent.agent import (
     render_boss_prompt,
     render_prompt,
 )
+from montferrand_agent.calendar import get_tenant_calendar
 from montferrand_agent.config import conversations_dir
-from montferrand_agent.models import Dialog, Report
+from montferrand_agent.crm import get_tenant_crm, render_customer_context_for_prompt
+from montferrand_agent.models import AgentTurn, BossReply, Dialog, Report
 from montferrand_agent.tenant import phone_to_filename
 
 
 class ConversationError(RuntimeError):
     """Raised when a conversation turn cannot be processed."""
+
+
+TraceEventKind = Literal[
+    "request_started",
+    "request_finished",
+    "tool_called",
+    "tool_result",
+    "tool_retry",
+    "warning",
+    "turn_finished",
+]
+
+
+@dataclass(frozen=True)
+class ConversationTraceEvent:
+    """Structured trace event emitted while running one agent turn."""
+
+    kind: TraceEventKind
+    summary: str
+    at_seconds: float
+    request_index: int | None = None
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    elapsed_seconds: float | None = None
+
+
+TraceObserver = Callable[[ConversationTraceEvent], None]
+
+
+def _emit_trace(observer: TraceObserver | None, event: ConversationTraceEvent) -> None:
+    """Send a trace event to the observer if tracing is enabled."""
+
+    if observer is not None:
+        observer(event)
+
+
+def _preview_text(text: str | None, limit: int = 120) -> str:
+    """Return a single-line preview clipped for CLI display."""
+
+    if not text:
+        return ""
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _summarize_request_parts(parts: Sequence[object]) -> str:
+    """Return a compact summary of the request parts sent to the model."""
+
+    labels: list[str] = []
+    for part in parts:
+        if isinstance(part, UserPromptPart):
+            if isinstance(part.content, str):
+                labels.append(f"user={_preview_text(part.content, limit=80)}")
+            else:
+                labels.append("user=<multipart>")
+        elif isinstance(part, ToolReturnPart):
+            labels.append(f"tool-return:{part.tool_name}")
+        elif isinstance(part, RetryPromptPart):
+            target = part.tool_name or "result"
+            labels.append(f"retry:{target}")
+        else:
+            part_kind = getattr(part, "part_kind", type(part).__name__)
+            labels.append(str(part_kind))
+
+    return ", ".join(labels) if labels else "<no parts>"
+
+
+def _summarize_model_response(response: ModelResponse) -> str:
+    """Return a compact summary of the model response for trace output."""
+
+    bits: list[str] = []
+    bits.append(f"parts={len(response.parts)}")
+
+    if response.finish_reason:
+        bits.append(f"finish={response.finish_reason}")
+
+    tool_names = [call.tool_name for call in response.tool_calls]
+    if tool_names:
+        bits.append("tools=" + ", ".join(tool_names))
+
+    text = _preview_text(response.text)
+    if text:
+        bits.append(f'text="{text}"')
+
+    thinking = response.thinking
+    if thinking:
+        bits.append(f"thinking={len(thinking)} chars")
+
+    return "; ".join(bits) if bits else "<empty response>"
+
+
+def _summarize_tool_result(result: ToolReturnPart | RetryPromptPart) -> str:
+    """Return a short preview of a tool result or retry instruction."""
+
+    if isinstance(result, RetryPromptPart):
+        content = result.model_response()
+        return _preview_text(content)
+
+    content = result.content
+    if isinstance(content, str):
+        return _preview_text(content)
+    return _preview_text(str(content))
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +345,6 @@ def reset_tenant(twilio_number: str) -> int:
 
     Returns the number of conversation files deleted.
     """
-    from montferrand_agent.calendar import reset_calendar
-
     tenant_dir = _tenant_data_dir(twilio_number)
 
     # Count files before deletion
@@ -250,7 +365,7 @@ def reset_tenant(twilio_number: str) -> int:
         shutil.rmtree(tenant_dir)
 
     # Wipe the tenant's calendar
-    reset_calendar(twilio_number)
+    get_tenant_calendar(twilio_number).reset()
 
     return count
 
@@ -363,20 +478,197 @@ async def _run_agent(
     twilio_number: str,
     *,
     is_boss: bool = False,
+    customer_phone: str | None = None,
+    conversation_id: str | None = None,
+    trace_observer: TraceObserver | None = None,
 ):
     """Run the appropriate agent with the assembled system prompt.
 
     When *is_boss* is True, uses the boss agent and boss prompt.
     Otherwise uses the customer-facing booking agent.
     """
-    agent = get_boss_agent() if is_boss else get_agent()
+    calendar = get_tenant_calendar(twilio_number)
+    crm = get_tenant_crm(twilio_number)
+    agent_factory = get_boss_agent if is_boss else get_agent
+    agent = cast(Any, agent_factory())
+    turn_started_at = time.perf_counter()
+    request_count = 0
+    tool_call_count = 0
+    repeated_tool_calls = 0
+    tool_started_at: dict[str, float] = {}
+    tool_signature_counts: dict[str, int] = {}
     try:
-        return await agent.run(
+        async with agent.iter(
             prompt,
             message_history=history,
             instructions=instructions,
-            deps=AgentDeps(twilio_number=twilio_number),
-        )
+            deps=AgentDeps(
+                calendar=calendar,
+                crm=crm,
+                customer_phone=customer_phone,
+                conversation_id=conversation_id,
+            ),
+        ) as run:
+            any_run = cast(Any, run)
+            next_node = cast(Any, run.next_node)
+
+            while not isinstance(next_node, End):
+                if isinstance(next_node, UserPromptNode):
+                    next_node = await any_run.next(next_node)
+                    continue
+
+                if isinstance(next_node, ModelRequestNode):
+                    request_count += 1
+                    request_started_at = time.perf_counter()
+                    _emit_trace(
+                        trace_observer,
+                        ConversationTraceEvent(
+                            kind="request_started",
+                            summary=_summarize_request_parts(next_node.request.parts),
+                            at_seconds=request_started_at - turn_started_at,
+                            request_index=request_count,
+                        ),
+                    )
+
+                    next_node = await any_run.next(next_node)
+                    request_elapsed = time.perf_counter() - request_started_at
+
+                    if isinstance(next_node, CallToolsNode):
+                        _emit_trace(
+                            trace_observer,
+                            ConversationTraceEvent(
+                                kind="request_finished",
+                                summary=_summarize_model_response(
+                                    next_node.model_response
+                                ),
+                                at_seconds=time.perf_counter() - turn_started_at,
+                                request_index=request_count,
+                                elapsed_seconds=request_elapsed,
+                            ),
+                        )
+                    continue
+
+                if isinstance(next_node, CallToolsNode):
+                    async with next_node.stream(run.ctx) as events:
+                        async for event in events:
+                            now = time.perf_counter()
+                            if isinstance(event, FunctionToolCallEvent):
+                                tool_call_count += 1
+                                tool_name = event.part.tool_name
+                                tool_call_id = event.tool_call_id
+                                tool_started_at[tool_call_id] = now
+                                args_json = event.part.args_as_json_str()
+                                args_preview = _preview_text(args_json)
+                                signature = f"{tool_name}:{args_json}"
+                                tool_signature_counts[signature] = (
+                                    tool_signature_counts.get(signature, 0) + 1
+                                )
+
+                                _emit_trace(
+                                    trace_observer,
+                                    ConversationTraceEvent(
+                                        kind="tool_called",
+                                        summary=(
+                                            f"{tool_name}({args_preview})"
+                                            if args_preview
+                                            else tool_name
+                                        ),
+                                        at_seconds=now - turn_started_at,
+                                        request_index=request_count,
+                                        tool_name=tool_name,
+                                        tool_call_id=tool_call_id,
+                                    ),
+                                )
+
+                                repeat_count = tool_signature_counts[signature]
+                                if repeat_count > 1:
+                                    repeated_tool_calls += 1
+                                    _emit_trace(
+                                        trace_observer,
+                                        ConversationTraceEvent(
+                                            kind="warning",
+                                            summary=(
+                                                f"repeated tool call x{repeat_count}: "
+                                                f"{tool_name}({args_preview})"
+                                            ),
+                                            at_seconds=now - turn_started_at,
+                                            request_index=request_count,
+                                            tool_name=tool_name,
+                                            tool_call_id=tool_call_id,
+                                        ),
+                                    )
+
+                            elif isinstance(event, FunctionToolResultEvent):
+                                tool_call_id = event.tool_call_id
+                                started_at = tool_started_at.pop(tool_call_id, now)
+                                elapsed = now - started_at
+                                result = event.result
+                                kind: TraceEventKind = (
+                                    "tool_retry"
+                                    if isinstance(result, RetryPromptPart)
+                                    else "tool_result"
+                                )
+                                _emit_trace(
+                                    trace_observer,
+                                    ConversationTraceEvent(
+                                        kind=kind,
+                                        summary=_summarize_tool_result(result),
+                                        at_seconds=now - turn_started_at,
+                                        request_index=request_count,
+                                        tool_name=result.tool_name,
+                                        tool_call_id=tool_call_id,
+                                        elapsed_seconds=elapsed,
+                                    ),
+                                )
+
+                    next_node = await any_run.next(next_node)
+                    if isinstance(next_node, ModelRequestNode):
+                        if any(
+                            isinstance(part, RetryPromptPart)
+                            for part in next_node.request.parts
+                        ):
+                            summary = (
+                                "model output rejected, retrying - "
+                                f"{_summarize_request_parts(next_node.request.parts)}"
+                            )
+                        elif not next_node.request.parts:
+                            summary = (
+                                "model returned an empty response, retrying the "
+                                "same request"
+                            )
+                        else:
+                            summary = ""
+
+                        if summary:
+                            _emit_trace(
+                                trace_observer,
+                                ConversationTraceEvent(
+                                    kind="warning",
+                                    summary=summary,
+                                    at_seconds=time.perf_counter() - turn_started_at,
+                                    request_index=request_count,
+                                ),
+                            )
+                    continue
+
+                next_node = await any_run.next(next_node)
+
+            result = cast(Any, run.result)
+            assert result is not None
+            total_elapsed = time.perf_counter() - turn_started_at
+            _emit_trace(
+                trace_observer,
+                ConversationTraceEvent(
+                    kind="turn_finished",
+                    summary=(
+                        f"{request_count} model request(s), {tool_call_count} tool call(s), "
+                        f"{repeated_tool_calls} repeated call warning(s)"
+                    ),
+                    at_seconds=total_elapsed,
+                    elapsed_seconds=total_elapsed,
+                ),
+            )
+            return result
     except Exception as exc:
         raise ConversationError(f"Agent call failed: {exc}") from exc
 
@@ -389,6 +681,8 @@ async def process_message(
     tenant_profile: str,
     twilio_number: str,
     is_boss: bool = False,
+    customer_phone: str | None = None,
+    trace_observer: TraceObserver | None = None,
 ) -> Union[Dialog, Report]:
     """Run one turn of conversation and return Dialog or Report.
 
@@ -408,12 +702,36 @@ async def process_message(
         prev_msg_count = len(history)
         prompt = _build_prompt(text, images)
 
-        if is_boss:
-            instructions = render_boss_prompt(tenant_profile)
-        else:
-            instructions = render_prompt(tenant_profile)
+        try:
+            if is_boss:
+                instructions = render_boss_prompt(tenant_profile)
+            else:
+                customer_context = (
+                    "- No CRM record is available for this sender phone number."
+                )
+                if customer_phone:
+                    crm = get_tenant_crm(twilio_number)
+                    crm_context = await crm.get_customer_context_by_phone(
+                        customer_phone
+                    )
+                    customer_context = render_customer_context_for_prompt(crm_context)
+                instructions = render_prompt(
+                    tenant_profile,
+                    customer_crm_context=customer_context,
+                )
+        except Exception as exc:
+            raise ConversationError(
+                f"Failed to assemble agent instructions: {exc}"
+            ) from exc
         result = await _run_agent(
-            prompt, history, instructions, twilio_number, is_boss=is_boss
+            prompt,
+            history,
+            instructions,
+            twilio_number,
+            is_boss=is_boss,
+            customer_phone=customer_phone,
+            conversation_id=conversation_id,
+            trace_observer=trace_observer,
         )
 
         all_messages = result.all_messages()
@@ -427,4 +745,9 @@ async def process_message(
                 conversation_id,
             )
 
-        return result.output
+        if is_boss:
+            boss_reply = BossReply.model_validate(result.output)
+            return Dialog(message=boss_reply.message)
+
+        turn = AgentTurn.model_validate(result.output)
+        return turn.to_public_result()
