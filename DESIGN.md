@@ -93,6 +93,8 @@
   - `30 jours gratuits`
   - `99 $ / mois ensuite`
   - `Aucun contrat a long terme`
+  - Comparison anchor: `~299 $ / mois pour une receptionniste virtuelle`
+  - Do not compare against a full-time employee in this section.
 - ROI examples (static cards or small table):
   - `1 appel de service de plus par mois` -> le systeme se paie tout seul
   - `3 appels de service de plus` -> X $ de profit supplementaire
