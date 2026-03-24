@@ -46,10 +46,8 @@ from montferrand_agent.conversation import (
     reset_tenant,
 )
 from montferrand_agent.crm import (
+    ensure_tenant_crm,
     TenantCrmError,
-    TenantCrmMissingError,
-    get_tenant_crm,
-    migrate_tenant_crm,
     provision_tenant_crm,
 )
 from montferrand_agent.ops import (
@@ -68,6 +66,7 @@ from montferrand_agent.ops import (
     record_processing_trace,
     run_readiness_checks,
 )
+from montferrand_agent.next_work_item import maybe_handle_next_work_item_command
 from montferrand_agent.tenant import (
     TenantConfig,
     TenantNotFoundError,
@@ -76,8 +75,6 @@ from montferrand_agent.tenant import (
     tenant_exists,
 )
 from montferrand_agent.plumber_router import (
-    job_card_token_ttl_hours,
-    job_card_url_for,
     router as plumber_router,
 )
 
@@ -223,83 +220,22 @@ def _twiml_response(text: str) -> Response:
     return Response(content=str(twiml), media_type="application/xml")
 
 
-_PLUMBER_NEXT_COMMANDS = {
-    "next",
-    "what's next",
-    "whats next",
-    "what is next",
-    "prochain",
-    "prochaine",
-    "suivant",
-    "ensuite",
-}
-
-
-def _normalize_command(text: str) -> str:
-    return " ".join(text.lower().split())
-
-
-def _format_job_window(start_iso: str | None, end_iso: str | None) -> str:
-    if not start_iso:
-        return "schedule pending"
-
-    from datetime import datetime
-
-    try:
-        start_dt = datetime.fromisoformat(start_iso)
-        if end_iso:
-            end_dt = datetime.fromisoformat(end_iso)
-            return (
-                f"{start_dt.strftime('%Y-%m-%d %H:%M')} to {end_dt.strftime('%H:%M')}"
-            )
-        return start_dt.strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        if end_iso:
-            return f"{start_iso} to {end_iso}"
-        return start_iso
-
-
 async def _maybe_handle_plumber_command(
     twilio_number: str,
     body: str,
     *,
     is_boss: bool,
 ) -> str | None:
-    if not is_boss:
-        return None
-    if _normalize_command(body) not in _PLUMBER_NEXT_COMMANDS:
-        return None
-
-    try:
-        crm = get_tenant_crm(twilio_number)
-    except TenantCrmMissingError:
-        logger.warning("CRM DB missing for plumber command on tenant %s", twilio_number)
-        return "Le dossier CRM de ce tenant n'est pas disponible pour le moment."
-
-    next_job = await crm.get_next_open_job()
-    if next_job is None or not next_job.success or next_job.job_id is None:
-        return "Aucun rendez-vous actif a venir pour le moment."
-
-    token = await crm.issue_job_token(
-        next_job.job_id,
-        ttl_hours=job_card_token_ttl_hours(),
+    reply = await maybe_handle_next_work_item_command(
+        twilio_number,
+        body,
+        is_boss=is_boss,
     )
-
-    try:
-        link = job_card_url_for(twilio_number, token)
-    except RuntimeError:
+    if reply is None:
+        return None
+    if "Open card:" not in reply:
         logger.warning("Public base URL is not configured; plumber link omitted")
-        link = ""
-
-    summary = (
-        f"Next: {_format_job_window(next_job.scheduled_start, next_job.scheduled_end)}, "
-        f"{next_job.customer_name or 'Unknown customer'}, "
-        f"{next_job.service_location or 'address missing'}. "
-        f"Issue: {next_job.issue_summary or 'service call'}."
-    )
-    if link:
-        return f"{summary} Open card: {link}"
-    return summary
+    return reply
 
 
 # ---------------------------------------------------------------------------
@@ -628,11 +564,9 @@ async def upsert_tenant(payload: TenantUpsertRequest) -> dict[str, str]:
     ensure_tenant_calendar(payload.twilio_number)
     try:
         if exists:
-            crm_path = migrate_tenant_crm(payload.twilio_number)
+            crm_path = ensure_tenant_crm(payload.twilio_number)
         else:
             crm_path = provision_tenant_crm(payload.twilio_number)
-    except TenantCrmMissingError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except TenantCrmError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -656,10 +590,10 @@ async def upsert_tenant(payload: TenantUpsertRequest) -> dict[str, str]:
     dependencies=[Depends(_validate_admin_token)],
 )
 async def delete_tenant_conversations(twilio_number: str) -> dict[str, object]:
-    """Delete all conversation data and reset the tenant calendar."""
+    """Delete all conversation data and reset the tenant calendar and CRM."""
     count = reset_tenant(twilio_number)
     logger.info(
-        "Reset tenant %s: deleted %d conversation(s) and reset calendar",
+        "Reset tenant %s: deleted %d conversation(s) and reset calendar and CRM",
         twilio_number,
         count,
     )
@@ -667,7 +601,7 @@ async def delete_tenant_conversations(twilio_number: str) -> dict[str, object]:
         "status": "ok",
         "deleted": count,
         "message": (
-            f"Deleted {count} conversation(s) and reset the calendar for "
+            f"Deleted {count} conversation(s) and reset the calendar and CRM for "
             f"{twilio_number}."
         ),
     }

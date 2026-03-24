@@ -3,6 +3,7 @@
 Uses FastAPI's TestClient — no real Twilio or LLM calls.
 """
 
+import sqlite3
 from pathlib import Path
 import time
 from unittest.mock import AsyncMock, patch
@@ -13,7 +14,7 @@ from twilio.request_validator import RequestValidator
 
 from montferrand_agent.calendar import get_tenant_calendar
 from montferrand_agent.conversation import ConversationError
-from montferrand_agent.crm import tenant_crm_db_path
+from montferrand_agent.crm import provision_tenant_crm, tenant_crm_db_path
 from montferrand_agent.models import Dialog
 from montferrand_agent.ops import get_message_timeline
 from montferrand_agent.server import _is_duplicate, _seen_sids, app
@@ -205,7 +206,7 @@ class TestAdminTenants:
 
         assert load_tenant_profile(TWILIO_NUMBER) == "v2"
 
-    def test_upsert_existing_tenant_with_missing_crm_returns_conflict(
+    def test_upsert_existing_tenant_with_missing_crm_reprovisions_db(
         self, client: TestClient, isolated_tenant_dir: Path, fake_dbmate
     ):
         headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
@@ -224,8 +225,9 @@ class TestAdminTenants:
         )
 
         assert first.status_code == 201
-        assert second.status_code == 409
-        assert "CRM DB is missing" in second.json()["detail"]
+        assert second.status_code == 201
+        assert load_tenant_profile(TWILIO_NUMBER) == "v2"
+        assert tenant_crm_db_path(TWILIO_NUMBER).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -238,13 +240,36 @@ class TestAdminResetConversations:
     def _set_admin_token(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("MONTFERRAND_ADMIN_TOKEN", ADMIN_TOKEN)
 
-    def test_reset_returns_deleted_count(self, client: TestClient, sms_tenant: Path):
+    def test_reset_returns_deleted_count(
+        self, client: TestClient, sms_tenant: Path, fake_dbmate
+    ):
         """DELETE endpoint returns the number of conversations deleted."""
         from pydantic_ai.messages import ModelRequest, UserPromptPart
 
         from montferrand_agent.conversation import _append_messages_to_disk
 
         backend = get_tenant_calendar(TWILIO_NUMBER)
+        crm_path = provision_tenant_crm(TWILIO_NUMBER)
+        conn = sqlite3.connect(crm_path)
+        try:
+            conn.execute(
+                "INSERT INTO crm_customers(display_name, preferred_language, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    "Jonathan Pelletier",
+                    "fr",
+                    "2026-03-20T10:00:00+00:00",
+                    "2026-03-20T10:00:00+00:00",
+                    "2026-03-20T10:00:00+00:00",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO customer_phones(customer_id, phone_e164, is_primary, created_at) VALUES (1, ?, 1, ?)",
+                (CUSTOMER_NUMBER, "2026-03-20T10:00:00+00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
         msg = ModelRequest(parts=[UserPromptPart(content="hello")])
         _append_messages_to_disk("conv1", [msg], TWILIO_NUMBER)
         _append_messages_to_disk("conv2", [msg], TWILIO_NUMBER)
@@ -265,9 +290,18 @@ class TestAdminResetConversations:
         data = response.json()
         assert data["status"] == "ok"
         assert data["deleted"] == 2
-        assert "reset the calendar" in data["message"]
+        assert "reset the calendar and CRM" in data["message"]
         assert backend.directory.exists()
         assert list(backend.directory.glob("*.ics")) == []
+        assert tenant_crm_db_path(TWILIO_NUMBER).exists()
+        conn = sqlite3.connect(tenant_crm_db_path(TWILIO_NUMBER))
+        try:
+            customer_count = conn.execute(
+                "SELECT COUNT(*) FROM crm_customers"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert customer_count == 0
 
     def test_reset_requires_auth(self, client: TestClient):
         response = client.delete(

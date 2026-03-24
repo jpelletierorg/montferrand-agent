@@ -37,6 +37,7 @@ def _seed_job(fake_dbmate) -> tuple[int, str, str]:
     )
     assert booking.success is True
     assert booking.event is not None
+    event = booking.event
 
     async def setup() -> tuple[int, str]:
         crm = get_tenant_crm(TWILIO_NUMBER)
@@ -51,17 +52,17 @@ def _seed_job(fake_dbmate) -> tuple[int, str, str]:
             customer_id=customer.customer_id,
             service_location_id=location.location_id,
             conversation_id="conv-123",
-            calendar_uid=booking.event.uid,
+            calendar_uid=event.uid,
             issue_summary=SUMMARY,
             plumber_notes=NOTES,
-            scheduled_start=booking.event.start_iso,
-            scheduled_end=booking.event.end_iso,
+            scheduled_start=event.start_iso,
+            scheduled_end=event.end_iso,
         )
         token = await crm.issue_job_token(job_id, ttl_hours=72)
         return job_id, token
 
     job_id, token = asyncio.run(setup())
-    return job_id, token, booking.event.uid
+    return job_id, token, event.uid
 
 
 class TestPlumberJobCard:
@@ -138,6 +139,57 @@ class TestPlumberJobCard:
 
         assert response.status_code == 404
         assert "invalid" in response.text.lower()
+
+    def test_edit_details_updates_crm_and_calendar(
+        self, isolated_data_dir, fake_dbmate
+    ):
+        job_id, token, uid = _seed_job(fake_dbmate)
+        tenant_key = phone_to_filename(TWILIO_NUMBER)
+        client = TestClient(app)
+
+        response = client.post(
+            f"/p/{tenant_key}/{token}/edit",
+            data={
+                "customer_name": "Jonathan P.",
+                "service_location": "456 rue Nouvelle, Brossard, J4Z 1A1",
+                "issue_summary": "Drain garage encore bloque",
+                "plumber_notes": "Verifier le drain et la pente.",
+                "access_notes": "Entrer par la porte laterale.",
+                "customer_summary": "Client prefere etre appele avant l'arrivee.",
+            },
+            follow_redirects=True,
+        )
+
+        assert response.status_code == 200
+        assert "Job details updated" in response.text
+        assert "Jonathan P." in response.text
+        assert "456 rue Nouvelle, Brossard, J4Z 1A1" in response.text
+
+        async def verify() -> None:
+            card = await get_tenant_crm(TWILIO_NUMBER).get_job_card(job_id)
+            assert card.customer_name == "Jonathan P."
+            assert card.service_location == "456 rue Nouvelle, Brossard, J4Z 1A1"
+            assert card.issue_summary == "Drain garage encore bloque"
+            assert card.plumber_notes == "Verifier le drain et la pente."
+            assert card.access_notes == "Entrer par la porte laterale."
+            assert (
+                card.customer_summary == "Client prefere etre appele avant l'arrivee."
+            )
+
+        asyncio.run(verify())
+
+        events = get_tenant_calendar(TWILIO_NUMBER).list_events(
+            "2030-03-24",
+            "2030-03-24",
+            include_past=True,
+        )
+        assert len(events.events) == 1
+        event = events.events[0]
+        assert event.uid == uid
+        assert event.customer_name == "Jonathan P."
+        assert event.location == "456 rue Nouvelle, Brossard, J4Z 1A1"
+        assert event.summary == "Drain garage encore bloque"
+        assert event.plumber_notes == "Verifier le drain et la pente."
 
 
 class TestPlumberNextCommand:

@@ -234,6 +234,15 @@ def is_boss(twilio_number: str, from_number: str) -> bool:
     return from_number in config.boss_numbers
 
 
+def tenant_phone_for_key(tenant_key: str) -> str:
+    """Resolve a hashed tenant storage key back to its phone number."""
+
+    for phone, _path in list_tenants():
+        if phone_to_filename(phone) == tenant_key:
+            return phone
+    raise TenantNotFoundError(f"No tenant found for key: {tenant_key}")
+
+
 def list_tenants() -> list[tuple[str, Path]]:
     """List all configured tenants.
 

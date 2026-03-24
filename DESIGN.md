@@ -91,7 +91,7 @@
 - Headline: `Essayez sans risque pendant 30 jours. 100 % satisfait ou rembourse.`
 - Pricing card:
   - `30 jours gratuits`
-  - `59,99 $ / mois ensuite`
+  - `99 $ / mois ensuite`
   - `Aucun contrat a long terme`
 - ROI examples (static cards or small table):
   - `1 appel de service de plus par mois` -> le systeme se paie tout seul

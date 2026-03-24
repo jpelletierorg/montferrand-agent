@@ -1,13 +1,20 @@
 """Tests for CLI tenant onboarding flows."""
 
+import asyncio
 import os
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 from typer.testing import CliRunner
 
 from montferrand_agent.calendar import get_tenant_calendar
-from montferrand_agent.cli import _build_cli_banner_text, _format_trace_event, app
+from montferrand_agent.cli import (
+    _build_cli_banner_text,
+    _cli_loop,
+    _format_trace_event,
+    app,
+)
 from montferrand_agent.conversation import ConversationTraceEvent
 from montferrand_agent.crm import tenant_crm_db_path
 from montferrand_agent.ops import (
@@ -97,6 +104,46 @@ def test_cli_model_flag_overrides_env(monkeypatch):
     assert os.environ.get("MONTFERRAND_MODEL") == "anthropic/claude-sonnet-4.6"
 
 
+def test_boss_cli_next_shortcut_uses_shared_helper(monkeypatch):
+    prompts = iter(["next", "!quit"])
+    seen_messages: list[str] = []
+
+    monkeypatch.setattr(
+        "montferrand_agent.cli._resolve_cli_tenant",
+        lambda: (TWILIO_NUMBER, TEST_PROFILE),
+    )
+    monkeypatch.setattr("montferrand_agent.cli.get_model_name", lambda: "gpt-test")
+    monkeypatch.setattr(
+        "montferrand_agent.cli.get_provider_name", lambda role="agent": "openrouter"
+    )
+    monkeypatch.setattr(
+        "montferrand_agent.cli.get_structured_output_strategy", lambda: "native"
+    )
+    monkeypatch.setattr(
+        "montferrand_agent.cli.console.input", lambda _prompt: next(prompts)
+    )
+    monkeypatch.setattr(
+        "montferrand_agent.cli._print_agent_message",
+        lambda message: seen_messages.append(message),
+    )
+
+    async def fake_shortcut(twilio_number: str, body: str, *, is_boss: bool):
+        assert twilio_number == TWILIO_NUMBER
+        assert body == "next"
+        assert is_boss is True
+        return "Next: 2030-03-24 09:00 to 12:00, Jonathan Pelletier. Open card: https://example.test/p/demo/token"
+
+    monkeypatch.setattr(
+        "montferrand_agent.cli.maybe_handle_next_work_item_command",
+        fake_shortcut,
+    )
+
+    asyncio.run(_cli_loop(agent_role="boss", trace=False))
+
+    assert len(seen_messages) == 1
+    assert "Open card: https://example.test/p/demo/token" in seen_messages[0]
+
+
 def test_latency_command_wires_into_async_runner():
     seen: list[tuple[str | None, str | None, int]] = []
 
@@ -184,13 +231,45 @@ def test_onboard_rejects_existing_tenant(
     assert "Tenant already exists" in second.output
 
 
+def test_onboard_remote_timeout_mentions_deploy(monkeypatch, tmp_path: Path):
+    prompt_file = tmp_path / "profile.txt"
+    prompt_file.write_text(TEST_PROFILE, encoding="utf-8")
+
+    monkeypatch.setenv("MONTFERRAND_HOST", "example.com")
+    monkeypatch.setenv("MONTFERRAND_ADMIN_TOKEN", "test-token")
+
+    def fake_post(*args, **kwargs):
+        request = httpx.Request("POST", "https://example.com/admin/tenants")
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    monkeypatch.setattr("montferrand_agent.cli.httpx.post", fake_post)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "onboard",
+            "--twilio-number",
+            TWILIO_NUMBER,
+            "--prompt-file",
+            str(prompt_file),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Timed out waiting for example.com" in result.output
+    assert "starting after a" in result.output
+    assert "deploy" in result.output
+    assert "https://example.com/health" in result.output
+
+
 def test_serve_runs_crm_migrations_before_starting_server():
     runner = CliRunner()
 
     with (
         patch(
-            "montferrand_agent.cli.migrate_all_tenant_crm",
-            return_value=[Path("/tmp/a")],
+            "montferrand_agent.cli.ensure_existing_tenant_crm",
+            return_value=([Path("/tmp/a")], []),
         ),
         patch("uvicorn.run") as mock_run,
     ):
@@ -200,7 +279,25 @@ def test_serve_runs_crm_migrations_before_starting_server():
     mock_run.assert_called_once()
 
 
-def test_reset_command_mentions_calendar():
+def test_serve_provisions_missing_crm_and_starts():
+    runner = CliRunner()
+
+    with (
+        patch(
+            "montferrand_agent.cli.ensure_existing_tenant_crm",
+            return_value=([], [TWILIO_NUMBER]),
+        ),
+        patch("uvicorn.run") as mock_run,
+    ):
+        result = runner.invoke(app, ["serve"])
+
+    assert result.exit_code == 0
+    assert "CRM provisioned for tenant(s) missing a database" in result.output
+    assert TWILIO_NUMBER in result.output
+    mock_run.assert_called_once()
+
+
+def test_reset_command_mentions_calendar_and_crm():
     runner = CliRunner()
 
     with patch("montferrand_agent.cli.reset_tenant", return_value=2):
@@ -210,7 +307,7 @@ def test_reset_command_mentions_calendar():
         )
 
     assert result.exit_code == 0
-    assert "Deleted 2 conversation(s) and reset the calendar" in result.output
+    assert "Deleted 2 conversation(s) and reset the calendar and CRM" in result.output
 
 
 def test_ops_doctor_command_uses_readiness_checks():

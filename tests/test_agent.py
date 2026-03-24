@@ -22,10 +22,19 @@ from montferrand_agent.agent import (
     get_fallback_pricing,
     get_agent,
     render_prompt,
+    tool_add_internal_note,
+    tool_get_customer_timeline,
     tool_list_schedule,
+    tool_search_customers,
+    tool_update_location_access_notes,
 )
 from montferrand_agent.calendar import ListEventsResult
 from montferrand_agent.calendar import get_tenant_calendar
+from montferrand_agent.crm import (
+    CrmMutationResult,
+    CustomerSearchResult,
+    CustomerTimelineResult,
+)
 from montferrand_agent.llm_backend import (
     DEFAULT_INCEPTION_BASE_URL,
     DEFAULT_OPENROUTER_BASE_URL,
@@ -354,3 +363,161 @@ class TestToolListSchedule:
             "include_past": True,
             "recent_past_hours": 4,
         }
+
+
+class TestBossCrmTools:
+    @pytest.mark.asyncio
+    async def test_search_customers_delegates_to_crm(self):
+        seen: dict[str, object] = {}
+
+        class FakeCrm:
+            async def search_customers(
+                self, query: str, *, limit: int = 5
+            ) -> CustomerSearchResult:
+                seen["query"] = query
+                seen["limit"] = limit
+                return CustomerSearchResult(
+                    success=True,
+                    matches=[],
+                    message="ok",
+                )
+
+        ctx = cast(
+            Any,
+            SimpleNamespace(
+                deps=cast(
+                    Any,
+                    AgentDeps(
+                        calendar=cast(Any, object()),
+                        crm=cast(Any, FakeCrm()),
+                    ),
+                )
+            ),
+        )
+
+        result = await tool_search_customers(ctx, "pelletier", limit=3)
+
+        assert result.success is True
+        assert seen == {"query": "pelletier", "limit": 3}
+
+    @pytest.mark.asyncio
+    async def test_get_customer_timeline_delegates_to_crm(self):
+        seen: dict[str, object] = {}
+
+        class FakeCrm:
+            async def get_customer_timeline(
+                self,
+                customer_id: int,
+                *,
+                limit_jobs: int = 5,
+                limit_notes: int = 5,
+            ) -> CustomerTimelineResult:
+                seen["customer_id"] = customer_id
+                seen["limit_jobs"] = limit_jobs
+                seen["limit_notes"] = limit_notes
+                return CustomerTimelineResult(
+                    success=True,
+                    customer_id=customer_id,
+                    customer_name="Jonathan Pelletier",
+                    message="ok",
+                )
+
+        ctx = cast(
+            Any,
+            SimpleNamespace(
+                deps=cast(
+                    Any,
+                    AgentDeps(
+                        calendar=cast(Any, object()),
+                        crm=cast(Any, FakeCrm()),
+                    ),
+                )
+            ),
+        )
+
+        result = await tool_get_customer_timeline(ctx, 17, limit_jobs=4, limit_notes=2)
+
+        assert result.success is True
+        assert seen == {"customer_id": 17, "limit_jobs": 4, "limit_notes": 2}
+
+    @pytest.mark.asyncio
+    async def test_add_internal_note_delegates_to_crm(self):
+        seen: dict[str, object] = {}
+
+        class FakeCrm:
+            async def add_internal_note(
+                self,
+                customer_id: int,
+                note: str,
+                *,
+                service_location_id: int | None = None,
+                job_id: int | None = None,
+            ) -> CrmMutationResult:
+                seen["customer_id"] = customer_id
+                seen["note"] = note
+                seen["service_location_id"] = service_location_id
+                seen["job_id"] = job_id
+                return CrmMutationResult(success=True, message="ok")
+
+        ctx = cast(
+            Any,
+            SimpleNamespace(
+                deps=cast(
+                    Any,
+                    AgentDeps(
+                        calendar=cast(Any, object()),
+                        crm=cast(Any, FakeCrm()),
+                    ),
+                )
+            ),
+        )
+
+        result = await tool_add_internal_note(
+            ctx,
+            9,
+            "client a un chien",
+            service_location_id=4,
+            job_id=8,
+        )
+
+        assert result.success is True
+        assert seen == {
+            "customer_id": 9,
+            "note": "client a un chien",
+            "service_location_id": 4,
+            "job_id": 8,
+        }
+
+    @pytest.mark.asyncio
+    async def test_update_location_access_notes_delegates_to_crm(self):
+        seen: dict[str, object] = {}
+
+        class FakeCrm:
+            async def update_location_access_notes(
+                self, location_id: int, access_notes: str
+            ) -> CrmMutationResult:
+                seen["location_id"] = location_id
+                seen["access_notes"] = access_notes
+                return CrmMutationResult(success=True, message="ok")
+
+        ctx = cast(
+            Any,
+            SimpleNamespace(
+                deps=cast(
+                    Any,
+                    AgentDeps(
+                        calendar=cast(Any, object()),
+                        crm=cast(Any, FakeCrm()),
+                    ),
+                )
+            ),
+        )
+
+        result = await tool_update_location_access_notes(
+            ctx,
+            12,
+            "porte de cote, code 4455",
+        )
+
+        assert result.success is True
+        assert seen == {"location_id": 12, "access_notes": "porte de cote, code 4455"}

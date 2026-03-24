@@ -50,15 +50,17 @@ from montferrand_agent.conversation import (
     reset_tenant,
 )
 from montferrand_agent.crm import (
+    ensure_existing_tenant_crm,
+    ensure_tenant_crm,
     TenantCrmError,
     migrate_all_tenant_crm,
-    migrate_tenant_crm,
     provision_all_tenant_crm,
     provision_tenant_crm,
     verify_all_tenant_crm,
 )
 from montferrand_agent.latency import LatencyReport, run_latency_benchmark
 from montferrand_agent.models import Report
+from montferrand_agent.next_work_item import maybe_handle_next_work_item_command
 from montferrand_agent.ops import (
     find_messages,
     get_message_timeline,
@@ -99,6 +101,12 @@ app.add_typer(crm_app, name="crm")
 app.add_typer(ops_app, name="ops")
 console = Console()
 CliAgentRole: TypeAlias = Literal["customer", "boss"]
+_REMOTE_ADMIN_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    read=120.0,
+    write=30.0,
+    pool=10.0,
+)
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -240,6 +248,41 @@ def _resolve_host(host: str | None, *, local: bool = False) -> str | None:
     return os.environ.get("MONTFERRAND_HOST", "").strip() or None
 
 
+def _remote_admin_url(host: str, path: str) -> str:
+    return f"https://{host}{path}"
+
+
+def _request_remote_admin(
+    method: Literal["GET", "POST", "DELETE"],
+    host: str,
+    path: str,
+    *,
+    json_body: dict[str, str | list[str]] | None = None,
+) -> httpx.Response:
+    token = _require_admin_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    url = _remote_admin_url(host, path)
+
+    try:
+        if method == "GET":
+            return httpx.get(url, headers=headers, timeout=_REMOTE_ADMIN_TIMEOUT)
+        if method == "DELETE":
+            return httpx.delete(url, headers=headers, timeout=_REMOTE_ADMIN_TIMEOUT)
+        return httpx.post(
+            url,
+            json=json_body,
+            headers=headers,
+            timeout=_REMOTE_ADMIN_TIMEOUT,
+        )
+    except httpx.TimeoutException:
+        _fatal(
+            f"Timed out waiting for {host}. The server may still be starting after "
+            f"a deploy. Try again in a minute or check {_remote_admin_url(host, '/health')}."
+        )
+    except httpx.RequestError as exc:
+        _fatal(f"Could not reach {host}: {exc}")
+
+
 def _push_to_remote(
     host: str,
     twilio_number: str,
@@ -247,21 +290,18 @@ def _push_to_remote(
     boss_numbers: list[str] | None = None,
 ) -> None:
     """POST a tenant config to a remote Montferrand server."""
-    token = _require_admin_token()
-
-    url = f"https://{host}/admin/tenants"
-    payload: dict = {
+    payload: dict[str, str | list[str]] = {
         "twilio_number": twilio_number,
         "tenant_profile": profile,
     }
     if boss_numbers:
         payload["boss_numbers"] = boss_numbers
 
-    response = httpx.post(
-        url,
-        json=payload,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
+    response = _request_remote_admin(
+        "POST",
+        host,
+        "/admin/tenants",
+        json_body=payload,
     )
     if response.status_code in {200, 201}:
         console.print(f"[green]Tenant pushed to {host}[/green]")
@@ -276,7 +316,7 @@ def _prepare_local_tenant_resources(twilio_number: str, *, create: bool) -> Path
     try:
         if create:
             return provision_tenant_crm(twilio_number)
-        return migrate_tenant_crm(twilio_number)
+        return ensure_tenant_crm(twilio_number)
     except TenantCrmError as exc:
         _fatal(str(exc))
 
@@ -674,6 +714,17 @@ async def _cli_loop(
         if not text and not images:
             continue
 
+        if agent_role == "boss" and text and not images:
+            shortcut_reply = await maybe_handle_next_work_item_command(
+                twilio_number,
+                text,
+                is_boss=True,
+            )
+            if shortcut_reply is not None:
+                _print_agent_message(shortcut_reply)
+                console.print()
+                continue
+
         # Process turn ----------------------------------------------------
         try:
             result = await process_message(
@@ -729,12 +780,17 @@ def serve(
     import uvicorn
 
     try:
-        migrated = migrate_all_tenant_crm()
+        migrated, provisioned = ensure_existing_tenant_crm()
     except TenantCrmError as exc:
         _fatal(str(exc))
 
     if migrated:
         console.print(f"[green]CRM migrated for {len(migrated)} tenant(s).[/green]")
+    if provisioned:
+        console.print(
+            "[green]CRM provisioned for tenant(s) missing a database:[/green] "
+            + ", ".join(provisioned)
+        )
 
     uvicorn.run(
         "montferrand_agent.server:app",
@@ -880,12 +936,10 @@ def tenant_edit(
 
     # Load current config as TOML
     if remote:
-        token = _require_admin_token()
-        url = f"https://{remote}/admin/tenants/{twilio_number}"
-        response = httpx.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
+        response = _request_remote_admin(
+            "GET",
+            remote,
+            f"/admin/tenants/{twilio_number}",
         )
         if response.status_code != 200:
             _fatal(f"Could not fetch tenant: {response.status_code}")
@@ -1138,18 +1192,16 @@ def _select_tenant_interactive() -> str:
 
 
 def _reset_remote(host: str, twilio_number: str) -> None:
-    """DELETE conversations and reset the calendar for a tenant remotely."""
-    token = _require_admin_token()
-    url = f"https://{host}/admin/tenants/{twilio_number}/conversations"
-    response = httpx.delete(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
+    """DELETE conversations and reset calendar and CRM data remotely."""
+    response = _request_remote_admin(
+        "DELETE",
+        host,
+        f"/admin/tenants/{twilio_number}/conversations",
     )
     if response.status_code == 200:
         count = response.json().get("deleted", "?")
         console.print(
-            f"[green]Deleted {count} conversation(s) and reset the calendar "
+            f"[green]Deleted {count} conversation(s) and reset the calendar and CRM "
             f"for {twilio_number} on {host}.[/green]"
         )
     else:
@@ -1263,7 +1315,7 @@ def reset_cmd(
         help="Reset locally even if MONTFERRAND_HOST is set",
     ),
 ) -> None:
-    """Wipe all conversation data and reset the tenant calendar."""
+    """Wipe all conversation data and reset tenant calendar and CRM data."""
     if twilio_number is None:
         twilio_number = _select_tenant_interactive()
 
@@ -1274,7 +1326,7 @@ def reset_cmd(
     else:
         count = reset_tenant(twilio_number)
         console.print(
-            f"[green]Deleted {count} conversation(s) and reset the calendar "
+            f"[green]Deleted {count} conversation(s) and reset the calendar and CRM "
             f"for {twilio_number}.[/green]"
         )
 

@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import secrets
+import shutil
 import subprocess
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -26,7 +27,12 @@ class TenantCrmMissingError(TenantCrmError):
 
 
 def crm_migrations_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "db" / "crm" / "migrations"
+    source_path = Path(__file__).resolve()
+    for base in source_path.parents:
+        candidate = base / "db" / "crm" / "migrations"
+        if candidate.exists():
+            return candidate
+    return source_path.parents[2] / "db" / "crm" / "migrations"
 
 
 def tenant_crm_dir(twilio_number: str) -> Path:
@@ -177,8 +183,49 @@ def migrate_all_tenant_crm() -> list[Path]:
     return [migrate_tenant_crm(phone) for phone, _path in list_tenants()]
 
 
+def migrate_existing_tenant_crm() -> tuple[list[Path], list[str]]:
+    migrated: list[Path] = []
+    missing: list[str] = []
+    for phone, _path in list_tenants():
+        db_path = tenant_crm_db_path(phone)
+        if not db_path.exists():
+            missing.append(phone)
+            continue
+        migrated.append(migrate_tenant_crm(phone))
+    return migrated, missing
+
+
+def ensure_tenant_crm(twilio_number: str) -> Path:
+    db_path = tenant_crm_db_path(twilio_number)
+    if db_path.exists():
+        return migrate_tenant_crm(twilio_number)
+    return provision_tenant_crm(twilio_number)
+
+
+def ensure_existing_tenant_crm() -> tuple[list[Path], list[str]]:
+    migrated: list[Path] = []
+    provisioned: list[str] = []
+    for phone, _path in list_tenants():
+        db_path = tenant_crm_db_path(phone)
+        if db_path.exists():
+            migrated.append(migrate_tenant_crm(phone))
+        else:
+            provision_tenant_crm(phone)
+            provisioned.append(phone)
+    return migrated, provisioned
+
+
 def verify_all_tenant_crm() -> list[Path]:
     return [verify_tenant_crm(phone) for phone, _path in list_tenants()]
+
+
+def reset_tenant_crm(twilio_number: str) -> Path:
+    """Wipe one tenant CRM database and reprovision a fresh empty schema."""
+
+    crm_dir = tenant_crm_dir(twilio_number)
+    if crm_dir.exists():
+        shutil.rmtree(crm_dir)
+    return provision_tenant_crm(twilio_number)
 
 
 @dataclass(frozen=True)
@@ -216,6 +263,7 @@ class CustomerContextResult(BaseModel):
     customer_summary: str = Field(default="")
     primary_location: str = Field(default="")
     known_locations: list[KnownLocation] = Field(default_factory=list)
+    active_jobs: list[CustomerJobSummary] = Field(default_factory=list)
     recent_jobs: list[CustomerJobSummary] = Field(default_factory=list)
     message: str = Field(default="")
 
@@ -227,6 +275,20 @@ class CustomerHistoryResult(BaseModel):
     message: str = Field(default="")
 
 
+class CustomerSearchHit(BaseModel):
+    customer_id: int
+    customer_name: str
+    primary_phone: str = ""
+    primary_location: str = ""
+    active_job_count: int = 0
+
+
+class CustomerSearchResult(BaseModel):
+    success: bool = Field(description="Whether the CRM search succeeded.")
+    matches: list[CustomerSearchHit] = Field(default_factory=list)
+    message: str = Field(default="")
+
+
 class JobNote(BaseModel):
     note_id: int
     author_kind: str
@@ -235,9 +297,24 @@ class JobNote(BaseModel):
     created_at: str
 
 
+class CustomerTimelineResult(BaseModel):
+    success: bool = Field(description="Whether the CRM timeline lookup succeeded.")
+    customer_id: int | None = None
+    customer_name: str = ""
+    phones: list[str] = Field(default_factory=list)
+    customer_summary: str = ""
+    known_locations: list[KnownLocation] = Field(default_factory=list)
+    active_jobs: list[CustomerJobSummary] = Field(default_factory=list)
+    recent_jobs: list[CustomerJobSummary] = Field(default_factory=list)
+    recent_notes: list[JobNote] = Field(default_factory=list)
+    message: str = ""
+
+
 class JobCardResult(BaseModel):
     success: bool = Field(description="Whether the job lookup succeeded.")
     job_id: int | None = None
+    customer_id: int | None = None
+    service_location_id: int | None = None
     calendar_uid: str = ""
     status: str = ""
     customer_name: str = ""
@@ -252,6 +329,14 @@ class JobCardResult(BaseModel):
     recent_jobs: list[CustomerJobSummary] = Field(default_factory=list)
     recent_notes: list[JobNote] = Field(default_factory=list)
     message: str = ""
+
+
+class CrmMutationResult(BaseModel):
+    success: bool = Field(description="Whether the CRM write succeeded.")
+    message: str = Field(default="")
+    customer_id: int | None = None
+    location_id: int | None = None
+    note_id: int | None = None
 
 
 def _now_iso() -> str:
@@ -298,8 +383,6 @@ def render_customer_context_for_prompt(context: CustomerContextResult | None) ->
     lines = ["- CRM matched this sender to an existing customer record."]
     if context.customer_name:
         lines.append(f"- Known customer name: {context.customer_name}")
-    if context.customer_summary:
-        lines.append(f"- CRM summary: {context.customer_summary}")
     if context.known_locations:
         if len(context.known_locations) == 1:
             lines.append(
@@ -308,14 +391,24 @@ def render_customer_context_for_prompt(context: CustomerContextResult | None) ->
         else:
             joined = "; ".join(loc.formatted_address for loc in context.known_locations)
             lines.append(f"- Multiple saved service addresses: {joined}")
-    if context.recent_jobs:
+
+    if context.active_jobs:
         summaries: list[str] = []
+        for job in context.active_jobs[:3]:
+            when = (job.scheduled_start or "")[:10] or "date unknown"
+            location = f" at {job.service_location}" if job.service_location else ""
+            issue = job.issue_summary or "service call"
+            summaries.append(f"{when}: {issue}{location} [{job.status}]")
+        lines.append(f"- Active jobs/bookings: {'; '.join(summaries)}")
+    elif context.recent_jobs:
+        summaries = []
         for job in context.recent_jobs[:2]:
             when = (job.scheduled_start or "")[:10] or "date unknown"
             location = f" at {job.service_location}" if job.service_location else ""
             issue = job.issue_summary or "service call"
             summaries.append(f"{when}: {issue}{location} [{job.status}]")
-        lines.append(f"- Recent jobs: {'; '.join(summaries)}")
+        lines.append(f"- Short past history: {'; '.join(summaries)}")
+
     lines.append(
         "- Use ONLY these CRM facts or facts returned by CRM tools. If a fact is not present, ask the customer instead of pretending to know it."
     )
@@ -419,6 +512,54 @@ class TenantCrmBackend:
             for row in rows
         ]
 
+    async def _get_active_jobs_for_customer(
+        self,
+        customer_id: int,
+        *,
+        limit: int = 3,
+    ) -> list[CustomerJobSummary]:
+        sql = """
+        SELECT
+            j.id,
+            j.status,
+            j.issue_summary,
+            j.scheduled_start,
+            j.scheduled_end,
+            j.calendar_uid,
+            COALESCE(sl.formatted_address, '') AS formatted_address
+        FROM jobs AS j
+        LEFT JOIN service_locations AS sl ON sl.id = j.service_location_id
+        WHERE j.customer_id = ?
+          AND j.status NOT IN ('cancelled', 'completed')
+        ORDER BY
+            CASE j.status
+                WHEN 'arrived' THEN 0
+                WHEN 'en_route' THEN 1
+                WHEN 'booked' THEN 2
+                WHEN 'follow_up_needed' THEN 3
+                ELSE 4
+            END,
+            COALESCE(j.scheduled_start, j.created_at) ASC,
+            j.id ASC
+        LIMIT ?
+        """
+
+        async with self.connection() as db:
+            async with db.execute(sql, (customer_id, limit)) as cursor:
+                rows = await cursor.fetchall()
+        return [
+            CustomerJobSummary(
+                job_id=row["id"],
+                status=row["status"],
+                issue_summary=row["issue_summary"],
+                service_location=row["formatted_address"],
+                scheduled_start=row["scheduled_start"],
+                scheduled_end=row["scheduled_end"],
+                calendar_uid=row["calendar_uid"],
+            )
+            for row in rows
+        ]
+
     async def _get_recent_notes_for_job(
         self, job_id: int, *, limit: int = 5
     ) -> list[JobNote]:
@@ -443,11 +584,48 @@ class TenantCrmBackend:
             for row in rows
         ]
 
+    async def _get_recent_notes_for_customer(
+        self, customer_id: int, *, limit: int = 5
+    ) -> list[JobNote]:
+        sql = """
+        SELECT id, author_kind, visibility, body, created_at
+        FROM customer_notes
+        WHERE customer_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        """
+        async with self.connection() as db:
+            async with db.execute(sql, (customer_id, limit)) as cursor:
+                rows = await cursor.fetchall()
+        return [
+            JobNote(
+                note_id=row["id"],
+                author_kind=row["author_kind"],
+                visibility=row["visibility"],
+                body=row["body"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def _get_phone_numbers_for_customer(self, customer_id: int) -> list[str]:
+        sql = """
+        SELECT phone_e164
+        FROM customer_phones
+        WHERE customer_id = ?
+        ORDER BY is_primary DESC, id ASC
+        """
+        async with self.connection() as db:
+            async with db.execute(sql, (customer_id,)) as cursor:
+                rows = await cursor.fetchall()
+        return [str(row["phone_e164"]) for row in rows if row["phone_e164"]]
+
     async def _get_job_card_by_id(self, job_id: int) -> JobCardResult:
         sql = """
         SELECT
             j.id,
             j.calendar_uid,
+            j.service_location_id,
             j.status,
             j.issue_summary,
             j.plumber_notes,
@@ -492,6 +670,12 @@ class TenantCrmBackend:
         return JobCardResult(
             success=True,
             job_id=int(row["id"]),
+            customer_id=customer_id,
+            service_location_id=(
+                None
+                if row["service_location_id"] is None
+                else int(row["service_location_id"])
+            ),
             calendar_uid=row["calendar_uid"] or "",
             status=row["status"] or "",
             customer_name=row["display_name"] or "",
@@ -527,6 +711,127 @@ class TenantCrmBackend:
             preferred_language=row["preferred_language"],
         )
 
+    async def search_customers(
+        self, query: str, *, limit: int = 5
+    ) -> CustomerSearchResult:
+        clean_query = _normalize_text(query)
+        if not clean_query:
+            return CustomerSearchResult(
+                success=True,
+                matches=[],
+                message="Search query is empty.",
+            )
+
+        like = f"%{clean_query}%"
+        sql = """
+        SELECT
+            c.id,
+            c.display_name,
+            COALESCE(
+                (
+                    SELECT p.phone_e164
+                    FROM customer_phones AS p
+                    WHERE p.customer_id = c.id
+                    ORDER BY p.is_primary DESC, p.id ASC
+                    LIMIT 1
+                ),
+                ''
+            ) AS primary_phone,
+            COALESCE(
+                (
+                    SELECT sl.formatted_address
+                    FROM service_locations AS sl
+                    WHERE sl.customer_id = c.id
+                    ORDER BY sl.is_primary DESC, sl.updated_at DESC, sl.id DESC
+                    LIMIT 1
+                ),
+                ''
+            ) AS primary_location,
+            (
+                SELECT COUNT(*)
+                FROM jobs AS j
+                WHERE j.customer_id = c.id
+                  AND j.status NOT IN ('cancelled', 'completed')
+            ) AS active_job_count
+        FROM crm_customers AS c
+        WHERE LOWER(c.display_name) LIKE LOWER(?)
+           OR EXISTS (
+                SELECT 1 FROM customer_phones AS p
+                WHERE p.customer_id = c.id AND LOWER(p.phone_e164) LIKE LOWER(?)
+           )
+           OR EXISTS (
+                SELECT 1 FROM service_locations AS sl
+                WHERE sl.customer_id = c.id AND LOWER(sl.formatted_address) LIKE LOWER(?)
+           )
+        ORDER BY active_job_count DESC, c.updated_at DESC, c.id DESC
+        LIMIT ?
+        """
+        async with self.connection() as db:
+            async with db.execute(sql, (like, like, like, limit)) as cursor:
+                rows = await cursor.fetchall()
+        matches = [
+            CustomerSearchHit(
+                customer_id=int(row["id"]),
+                customer_name=row["display_name"] or "",
+                primary_phone=row["primary_phone"] or "",
+                primary_location=row["primary_location"] or "",
+                active_job_count=int(row["active_job_count"] or 0),
+            )
+            for row in rows
+        ]
+        return CustomerSearchResult(
+            success=True,
+            matches=matches,
+            message=f"Found {len(matches)} customer(s) matching '{clean_query}'.",
+        )
+
+    async def get_customer_timeline(
+        self,
+        customer_id: int,
+        *,
+        limit_jobs: int = 5,
+        limit_notes: int = 5,
+    ) -> CustomerTimelineResult:
+        sql = """
+        SELECT id, display_name
+        FROM crm_customers
+        WHERE id = ?
+        LIMIT 1
+        """
+        async with self.connection() as db:
+            async with db.execute(sql, (customer_id,)) as cursor:
+                row = await cursor.fetchone()
+        if row is None:
+            return CustomerTimelineResult(
+                success=False,
+                message=f"No customer found for id {customer_id}.",
+            )
+
+        customer_summary = await self._get_customer_summary_text(customer_id)
+        phones = await self._get_phone_numbers_for_customer(customer_id)
+        locations = await self._get_locations_for_customer(customer_id)
+        active_jobs = await self._get_active_jobs_for_customer(
+            customer_id, limit=limit_jobs
+        )
+        recent_jobs = await self._get_recent_jobs_for_customer(
+            customer_id, limit=limit_jobs
+        )
+        recent_notes = await self._get_recent_notes_for_customer(
+            customer_id, limit=limit_notes
+        )
+        return CustomerTimelineResult(
+            success=True,
+            customer_id=customer_id,
+            customer_name=row["display_name"] or "",
+            phones=phones,
+            customer_summary=customer_summary,
+            known_locations=locations,
+            active_jobs=active_jobs,
+            recent_jobs=recent_jobs,
+            recent_notes=recent_notes,
+            message=f"Loaded customer timeline for {row['display_name'] or customer_id}.",
+        )
+
     async def get_customer_context_by_phone(
         self, phone_e164: str
     ) -> CustomerContextResult:
@@ -539,9 +844,15 @@ class TenantCrmBackend:
             )
 
         locations = await self._get_locations_for_customer(customer.customer_id)
-        recent_jobs = await self._get_recent_jobs_for_customer(
+        active_jobs = await self._get_active_jobs_for_customer(
             customer.customer_id, limit=3
         )
+        recent_jobs = []
+        if not active_jobs:
+            recent_jobs = await self._get_recent_jobs_for_customer(
+                customer.customer_id,
+                limit=2,
+            )
         summary_text = await self._get_customer_summary_text(customer.customer_id)
         primary_location = next(
             (
@@ -560,6 +871,7 @@ class TenantCrmBackend:
             customer_summary=summary_text,
             primary_location=primary_location,
             known_locations=locations,
+            active_jobs=active_jobs,
             recent_jobs=recent_jobs,
             message=(f"Loaded CRM context for {customer.display_name or phone_e164}."),
         )
@@ -753,6 +1065,43 @@ class TenantCrmBackend:
     ) -> int:
         now = _now_iso()
         async with self.connection() as db:
+            async with db.execute(
+                "SELECT id FROM jobs WHERE calendar_uid = ? LIMIT 1",
+                (calendar_uid,),
+            ) as cursor:
+                existing = await cursor.fetchone()
+
+            if existing is not None:
+                await db.execute(
+                    """
+                    UPDATE jobs
+                    SET customer_id = ?,
+                        service_location_id = ?,
+                        conversation_id = ?,
+                        status = 'booked',
+                        issue_summary = ?,
+                        plumber_notes = ?,
+                        scheduled_start = ?,
+                        scheduled_end = ?,
+                        updated_at = ?,
+                        closed_at = NULL
+                    WHERE id = ?
+                    """,
+                    (
+                        customer_id,
+                        service_location_id,
+                        conversation_id,
+                        issue_summary,
+                        plumber_notes,
+                        scheduled_start,
+                        scheduled_end,
+                        now,
+                        int(existing["id"]),
+                    ),
+                )
+                await db.commit()
+                return int(existing["id"])
+
             cursor = await db.execute(
                 """
                 INSERT INTO jobs(
@@ -833,6 +1182,176 @@ class TenantCrmBackend:
                 ),
             )
             await db.commit()
+
+    async def add_internal_note(
+        self,
+        customer_id: int,
+        body: str,
+        *,
+        service_location_id: int | None = None,
+        job_id: int | None = None,
+    ) -> CrmMutationResult:
+        clean_body = _normalize_text(body)
+        if not clean_body:
+            return CrmMutationResult(success=False, message="Note body is empty.")
+
+        async with self.connection() as db:
+            async with db.execute(
+                "SELECT id FROM crm_customers WHERE id = ? LIMIT 1",
+                (customer_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return CrmMutationResult(
+                    success=False,
+                    customer_id=customer_id,
+                    message=f"No customer found for id {customer_id}.",
+                )
+
+            cursor = await db.execute(
+                """
+                INSERT INTO customer_notes(
+                    customer_id,
+                    service_location_id,
+                    job_id,
+                    visibility,
+                    author_kind,
+                    body,
+                    created_at
+                ) VALUES (?, ?, ?, 'boss_only', 'boss', ?, ?)
+                """,
+                (customer_id, service_location_id, job_id, clean_body, _now_iso()),
+            )
+            await db.commit()
+        note_id = cursor.lastrowid
+        return CrmMutationResult(
+            success=True,
+            customer_id=customer_id,
+            note_id=None if note_id is None else int(note_id),
+            message="Internal note saved.",
+        )
+
+    async def upsert_customer_summary(
+        self, customer_id: int, summary_text: str
+    ) -> CrmMutationResult:
+        clean_summary = summary_text.strip()
+        now = _now_iso()
+        async with self.connection() as db:
+            async with db.execute(
+                "SELECT id FROM crm_customers WHERE id = ? LIMIT 1",
+                (customer_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return CrmMutationResult(
+                    success=False,
+                    customer_id=customer_id,
+                    message=f"No customer found for id {customer_id}.",
+                )
+
+            if clean_summary:
+                await db.execute(
+                    """
+                    INSERT INTO customer_summaries(customer_id, summary_text, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(customer_id) DO UPDATE SET
+                        summary_text = excluded.summary_text,
+                        updated_at = excluded.updated_at
+                    """,
+                    (customer_id, clean_summary, now),
+                )
+            else:
+                await db.execute(
+                    "DELETE FROM customer_summaries WHERE customer_id = ?",
+                    (customer_id,),
+                )
+            await db.commit()
+        return CrmMutationResult(
+            success=True,
+            customer_id=customer_id,
+            message="Customer summary updated.",
+        )
+
+    async def update_location_access_notes(
+        self, location_id: int, access_notes: str
+    ) -> CrmMutationResult:
+        clean_notes = access_notes.strip()
+        async with self.connection() as db:
+            cursor = await db.execute(
+                """
+                UPDATE service_locations
+                SET access_notes = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (clean_notes, _now_iso(), location_id),
+            )
+            await db.commit()
+        if cursor.rowcount == 0:
+            return CrmMutationResult(
+                success=False,
+                location_id=location_id,
+                message=f"No service location found for id {location_id}.",
+            )
+        return CrmMutationResult(
+            success=True,
+            location_id=location_id,
+            message="Access notes updated.",
+        )
+
+    async def amend_job_card_fields(
+        self,
+        job_id: int,
+        *,
+        customer_name: str,
+        service_location: str,
+        issue_summary: str,
+        plumber_notes: str,
+        access_notes: str,
+        customer_summary: str,
+    ) -> JobCardResult:
+        card = await self.get_job_card(job_id)
+        if not card.success or card.job_id is None or card.customer_id is None:
+            return card
+
+        clean_customer_name = _normalize_text(customer_name) or card.customer_name
+        clean_service_location = (
+            _normalize_address(service_location) or card.service_location
+        )
+        clean_issue_summary = _normalize_text(issue_summary) or card.issue_summary
+        clean_plumber_notes = plumber_notes.strip() or card.plumber_notes
+
+        customer = await self.upsert_customer_for_phone(
+            card.customer_phone,
+            clean_customer_name,
+        )
+        location = await self.upsert_service_location_for_customer(
+            customer.customer_id,
+            clean_service_location,
+        )
+        await self.update_location_access_notes(location.location_id, access_notes)
+        await self.upsert_customer_summary(customer.customer_id, customer_summary)
+
+        async with self.connection() as db:
+            await db.execute(
+                """
+                UPDATE jobs
+                SET service_location_id = ?,
+                    issue_summary = ?,
+                    plumber_notes = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    location.location_id,
+                    clean_issue_summary,
+                    clean_plumber_notes,
+                    _now_iso(),
+                    job_id,
+                ),
+            )
+            await db.commit()
+
+        return await self.get_job_card(job_id)
 
     async def sync_job_after_booking_modify(
         self,
@@ -1002,6 +1521,13 @@ class TenantCrmBackend:
 
 def get_tenant_crm(twilio_number: str) -> TenantCrmBackend:
     return TenantCrmBackend(path=tenant_crm_db_path(twilio_number))
+
+
+def maybe_get_tenant_crm(twilio_number: str) -> TenantCrmBackend | None:
+    try:
+        return get_tenant_crm(twilio_number)
+    except TenantCrmMissingError:
+        return None
 
 
 def get_tenant_crm_by_key(tenant_key: str) -> TenantCrmBackend:

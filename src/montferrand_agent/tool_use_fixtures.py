@@ -8,6 +8,7 @@ simulate the whole conversation loop.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 from pydantic_ai.messages import (
     ModelMessage,
@@ -24,6 +25,42 @@ def _user(text: str) -> ModelRequest:
 
 def _assistant(text: str) -> ModelResponse:
     return ModelResponse(parts=[TextPart(content=text)])
+
+
+_MONTHS_FR = {
+    1: "janvier",
+    2: "fevrier",
+    3: "mars",
+    4: "avril",
+    5: "mai",
+    6: "juin",
+    7: "juillet",
+    8: "aout",
+    9: "septembre",
+    10: "octobre",
+    11: "novembre",
+    12: "decembre",
+}
+
+
+def _next_fixture_booking_date(today: date | None = None) -> date:
+    """Return the next future weekday for booking fixtures."""
+
+    candidate = (today or date.today()) + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _format_french_date(value: date) -> str:
+    """Return a simple French date label like '24 mars 2026'."""
+
+    return f"{value.day} {_MONTHS_FR[value.month]} {value.year}"
+
+
+BOOKING_READY_DATE = _next_fixture_booking_date()
+BOOKING_READY_DATE_ISO = BOOKING_READY_DATE.isoformat()
+BOOKING_READY_DATE_LABEL = _format_french_date(BOOKING_READY_DATE)
 
 
 @dataclass(frozen=True)
@@ -50,11 +87,11 @@ BOOKING_READY_FIXTURE = ToolUseFixture(
         ),
         _user("Oui, tout le reste fonctionne normalement."),
         _assistant(
-            "Ca ressemble a une fuite sous l'evier, a confirmer sur place. On peut passer le 19 mars 2026 entre 9h et 12h pour environ 180 a 260 $, a confirmer sur place."
+            f"Ca ressemble a une fuite sous l'evier, a confirmer sur place. On peut passer le {BOOKING_READY_DATE_LABEL} entre 9h et 12h pour environ 180 a 260 $, a confirmer sur place."
         ),
     ],
     latest_user_message=(
-        "Oui, le 19 mars 2026 entre 9h et 12h me convient. Je m'appelle Jean Tremblay, l'adresse est "
+        f"Oui, le {BOOKING_READY_DATE_LABEL} entre 9h et 12h me convient. Je m'appelle Jean Tremblay, l'adresse est "
         "123 rue Test, Longueuil, J4K 1A1, et vous pouvez me joindre a ce numero."
     ),
     expected_tool_name="tool_create_service_call",
@@ -79,7 +116,7 @@ AVAILABILITY_QUERY_FIXTURE = ToolUseFixture(
 TOOL_USE_FIXTURES = [BOOKING_READY_FIXTURE, AVAILABILITY_QUERY_FIXTURE]
 
 BOOKING_READY_CREATE_SERVICE_CALL_ARGS = {
-    "date": "2026-03-19",
+    "date": BOOKING_READY_DATE_ISO,
     "start_time": "09:00",
     "end_time": "12:00",
     "summary": "Fuite sous évier de cuisine - Jean Tremblay",

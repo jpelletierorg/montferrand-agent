@@ -6,18 +6,26 @@ All tests are pure logic — no LLM calls.
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from pydantic_evals.evaluators import EvaluationReason
 
 from montferrand_agent.evals import (
     BossEvalResult,
     ConversationResult,
     NoSlowTurns,
+    RUBRIC_SMS_STYLE,
+    SCENARIOS,
     Scenario,
     ToolUseSmokeResult,
+    _RUBRICS,
+    _eval_runtime_numbers,
     _display_name,
+    _format_transcript_entry,
     _pass_fail,
     main,
+    run_scenario,
 )
+from montferrand_agent.models import Report
 
 
 # ---------------------------------------------------------------------------
@@ -45,12 +53,145 @@ class TestPassFail:
 class TestDisplayName:
     def test_known_name(self):
         assert _display_name("ConversationConverged") == "Converged"
+        assert _display_name("consultative_flow") == "Consult"
         assert _display_name("diagnostic_expertise") == "Diagnostic"
         assert _display_name("explicit_booking_dates") == "Dates"
         assert _display_name("NoSlowTurns") == "Speed"
 
     def test_unknown_name_returns_itself(self):
         assert _display_name("something_new") == "something_new"
+
+
+class TestScenarioCoverage:
+    def test_self_diagnosed_drain_scenario_is_registered(self):
+        scenario = SCENARIOS["self_diagnosed_drain"]
+        assert isinstance(scenario, Scenario)
+        assert "drain bouché au sous-sol" in scenario.persona
+
+
+class TestEvalRuntimeNumbers:
+    def test_returns_distinct_tenant_and_customer_numbers(self):
+        tenant_number, customer_number = _eval_runtime_numbers("scenario-a")
+
+        assert tenant_number.startswith("+1")
+        assert customer_number.startswith("+1")
+        assert len(tenant_number) == 12
+        assert len(customer_number) == 12
+        assert tenant_number != customer_number
+
+    def test_different_run_keys_get_different_numbers(self):
+        first = _eval_runtime_numbers("scenario-a")
+        second = _eval_runtime_numbers("scenario-b")
+
+        assert first != second
+
+
+class TestTranscriptFormatting:
+    def test_format_transcript_entry_marks_message_boundaries(self):
+        entry = _format_transcript_entry(
+            speaker="AGENT",
+            message_index=2,
+            message="Bonjour.\n\nDeuxieme paragraphe.",
+        )
+
+        assert entry.startswith("[2] AGENT MESSAGE:")
+        assert "Deuxieme paragraphe." in entry
+        assert entry.endswith("<END MESSAGE>")
+
+
+class TestJudgeConfiguration:
+    def test_only_soft_llm_judges_remain(self):
+        names = [name for _rubric, name in _RUBRICS]
+
+        assert names == [
+            "diagnostic_expertise",
+            "consultative_flow",
+            "proactive_proposal",
+            "sms_style",
+            "natural_tone",
+            "preliminary_framing",
+            "plain_language",
+            "no_assumed_history",
+            "greeting_introduction",
+            "paragraph_readability",
+        ]
+
+    def test_sms_style_rubric_relaxes_question_count(self):
+        assert "at most one question" not in RUBRIC_SMS_STYLE
+        assert "not feel drowned in questions" in RUBRIC_SMS_STYLE
+
+
+class TestRunScenarioIsolation:
+    @staticmethod
+    def _done_report() -> Report:
+        return Report(
+            message="C'est reserve.",
+            customer_name="Test Customer",
+            service_location="123 rue Test, Longueuil, J4K 1A1",
+            issue_description="Drain bouche.",
+            appointment_window="2026-03-24 09:00-12:00",
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_scenario_uses_isolated_eval_numbers_and_resets_crm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        scenario = Scenario(persona="Test persona", max_turns=1)
+        captured: list[tuple[str, str, str]] = []
+        resets: list[str] = []
+
+        monkeypatch.setattr(
+            "montferrand_agent.evals.build_customer_agent", lambda _persona: MagicMock()
+        )
+        monkeypatch.setattr(
+            "montferrand_agent.evals.new_conversation_id", lambda: "conv-123"
+        )
+
+        async def fake_run_customer_turn(*args, **kwargs):
+            del args, kwargs
+            return "bonjour", [], None
+
+        async def fake_run_agent_turn(
+            conversation_id: str,
+            customer_message: str,
+            transcript_lines: list[str],
+            turns: int,
+            tenant_number: str,
+            customer_phone: str,
+        ):
+            del transcript_lines, turns
+            captured.append((conversation_id, tenant_number, customer_phone))
+            return self._done_report(), 0.1, None
+
+        monkeypatch.setattr(
+            "montferrand_agent.evals._run_customer_turn", fake_run_customer_turn
+        )
+        monkeypatch.setattr(
+            "montferrand_agent.evals._run_agent_turn", fake_run_agent_turn
+        )
+        monkeypatch.setattr(
+            "montferrand_agent.evals.reset",
+            lambda conversation_id, twilio_number: resets.append(
+                f"reset:{conversation_id}:{twilio_number}"
+            ),
+        )
+        monkeypatch.setattr(
+            "montferrand_agent.evals.reset_calendar",
+            lambda twilio_number: resets.append(f"calendar:{twilio_number}"),
+        )
+        monkeypatch.setattr(
+            "montferrand_agent.evals.reset_tenant_crm",
+            lambda twilio_number: resets.append(f"crm:{twilio_number}"),
+        )
+
+        result = await run_scenario(scenario)
+
+        expected_tenant, expected_customer = _eval_runtime_numbers("conv-123")
+        assert result.report is not None
+        assert captured == [("conv-123", expected_tenant, expected_customer)]
+        assert f"reset:conv-123:{expected_tenant}" in resets
+        assert f"calendar:{expected_tenant}" in resets
+        assert f"crm:{expected_tenant}" in resets
 
 
 # ---------------------------------------------------------------------------

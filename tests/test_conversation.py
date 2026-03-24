@@ -3,6 +3,7 @@
 All tests are pure logic — no LLM calls.
 """
 
+import sqlite3
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,7 +32,11 @@ from montferrand_agent.conversation import (
     reset,
     reset_tenant,
 )
-from montferrand_agent.crm import get_tenant_crm, provision_tenant_crm
+from montferrand_agent.crm import (
+    get_tenant_crm,
+    provision_tenant_crm,
+    tenant_crm_db_path,
+)
 from montferrand_agent.models import AgentTurn, Dialog, Report
 
 from .conftest import CUSTOMER_NUMBER, TWILIO_NUMBER, assert_hex_string
@@ -379,6 +384,43 @@ class TestResetTenant:
         assert "conv_mem" not in _histories
         assert "conv_mem" not in _costs
 
+    def test_reset_reprovisions_empty_crm(self, fake_dbmate):
+        path = provision_tenant_crm(_TN)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "INSERT INTO crm_customers(display_name, preferred_language, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    "Jonathan Pelletier",
+                    "fr",
+                    "2026-03-20T10:00:00+00:00",
+                    "2026-03-20T10:00:00+00:00",
+                    "2026-03-20T10:00:00+00:00",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO customer_phones(customer_id, phone_e164, is_primary, created_at) VALUES (1, ?, 1, ?)",
+                (CUSTOMER_NUMBER, "2026-03-20T10:00:00+00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        reset_tenant(_TN)
+
+        assert tenant_crm_db_path(_TN).exists()
+        conn = sqlite3.connect(tenant_crm_db_path(_TN))
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM crm_customers").fetchone()[0]
+            migration_count = conn.execute(
+                "SELECT COUNT(*) FROM schema_migrations"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0
+        assert migration_count > 0
+
 
 class TestProcessMessageReturnTypes:
     @pytest.fixture(autouse=True)
@@ -475,6 +517,30 @@ class TestProcessMessageReturnTypes:
         instructions = mock_run.call_args.args[2]
         assert "Known customer name: Jonathan Pelletier" in instructions
         assert "123 rue Test, Longueuil, J4K 1A1" in instructions
+
+    @pytest.mark.asyncio
+    async def test_process_message_falls_back_when_crm_db_is_missing(self):
+        fake_result = SimpleNamespace(
+            output=AgentTurn(kind="dialog", message="Bonjour"),
+            all_messages=lambda: [],
+            usage=lambda: RunUsage(),
+        )
+
+        with patch(
+            "montferrand_agent.conversation._run_agent",
+            AsyncMock(return_value=fake_result),
+        ) as mock_run:
+            result = await process_message(
+                "conv_missing_crm",
+                "hello",
+                tenant_profile="You are a plumber.",
+                twilio_number=_TN,
+                customer_phone=CUSTOMER_NUMBER,
+            )
+
+        assert result == Dialog(message="Bonjour")
+        instructions = mock_run.call_args.args[2]
+        assert "No CRM record is available" in instructions
 
 
 # ---------------------------------------------------------------------------

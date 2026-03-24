@@ -8,12 +8,17 @@ from urllib.parse import quote_plus
 from fastapi import APIRouter, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from montferrand_agent.calendar import modify_event
 from montferrand_agent.crm import (
     JobCardResult,
     TenantCrmMissingError,
     get_tenant_crm_by_key,
 )
-from montferrand_agent.tenant import phone_to_filename
+from montferrand_agent.tenant import (
+    TenantNotFoundError,
+    phone_to_filename,
+    tenant_phone_for_key,
+)
 
 router = APIRouter()
 
@@ -237,6 +242,22 @@ def _job_card_html(
       </section>
 
       <section class="section">
+        <h2>Edit job details</h2>
+        <form method="post" action="/p/{tenant_key}/{token}/edit">
+          <p class="muted" style="margin-bottom:12px">Edit non-scheduling job details. Date and time stay managed from the calendar side.</p>
+          <div style="display:grid;gap:10px">
+            <input name="customer_name" value="{customer_name}" placeholder="Customer name" style="width:100%;border:1px solid var(--line);border-radius:14px;padding:12px;font:inherit;background:#fff">
+            <input name="service_location" value="{service_location}" placeholder="Service address" style="width:100%;border:1px solid var(--line);border-radius:14px;padding:12px;font:inherit;background:#fff">
+            <input name="issue_summary" value="{issue_summary}" placeholder="Issue summary" style="width:100%;border:1px solid var(--line);border-radius:14px;padding:12px;font:inherit;background:#fff">
+            <textarea name="plumber_notes" placeholder="Dispatch / plumber notes">{plumber_notes}</textarea>
+            <textarea name="access_notes" placeholder="Access notes">{access_notes}</textarea>
+            <textarea name="customer_summary" placeholder="CRM customer summary">{customer_summary}</textarea>
+          </div>
+          <div style="margin-top:12px"><button type="submit">Save details</button></div>
+        </form>
+      </section>
+
+      <section class="section">
         <h2>Status</h2>
         <form class="actions" method="post" action="/p/{tenant_key}/{token}/status">
           <button type="submit" name="status" value="en_route">En route</button>
@@ -305,6 +326,59 @@ async def update_plumber_job_status(
     return _redirect_to_card(
         tenant_key, token, f"Status updated to {_status_label(status)}."
     )
+
+
+@router.post("/p/{tenant_key}/{token}/edit")
+async def edit_plumber_job_details(
+    tenant_key: str,
+    token: str,
+    customer_name: str = Form(""),
+    service_location: str = Form(""),
+    issue_summary: str = Form(""),
+    plumber_notes: str = Form(""),
+    access_notes: str = Form(""),
+    customer_summary: str = Form(""),
+) -> RedirectResponse:
+    card = await _load_job_card(tenant_key, token)
+    if card is None or not card.success or card.job_id is None:
+        return _redirect_to_card(tenant_key, token, "This job link is no longer valid.")
+
+    crm = get_tenant_crm_by_key(tenant_key)
+    updated = await crm.amend_job_card_fields(
+        card.job_id,
+        customer_name=customer_name,
+        service_location=service_location,
+        issue_summary=issue_summary,
+        plumber_notes=plumber_notes,
+        access_notes=access_notes,
+        customer_summary=customer_summary,
+    )
+    if not updated.success:
+        return _redirect_to_card(
+            tenant_key, token, updated.message or "Unable to save details."
+        )
+
+    notice = "Job details updated."
+    if updated.calendar_uid:
+        try:
+            twilio_number = tenant_phone_for_key(tenant_key)
+        except TenantNotFoundError:
+            notice = "Job details updated in CRM, but tenant lookup failed for calendar sync."
+        else:
+            calendar_result = modify_event(
+                twilio_number,
+                updated.calendar_uid,
+                summary=updated.issue_summary,
+                customer_name=updated.customer_name,
+                customer_phone=updated.customer_phone,
+                location=updated.service_location,
+                plumber_notes=updated.plumber_notes,
+                description=updated.plumber_notes,
+            )
+            if not calendar_result.success:
+                notice = "Job details updated in CRM, but the calendar snapshot could not be synced."
+
+    return _redirect_to_card(tenant_key, token, notice)
 
 
 @router.post("/p/{tenant_key}/{token}/closeout")

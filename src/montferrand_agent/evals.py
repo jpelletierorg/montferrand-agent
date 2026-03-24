@@ -13,11 +13,13 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from typing import Mapping
 from unittest.mock import patch
 
 import logfire
@@ -61,7 +63,7 @@ from montferrand_agent.conversation import (
     process_message,
     reset,
 )
-from montferrand_agent.crm import provision_tenant_crm
+from montferrand_agent.crm import get_tenant_crm, provision_tenant_crm, reset_tenant_crm
 from montferrand_agent.customer import (
     CustomerAgentError,
     build_customer_agent,
@@ -78,6 +80,22 @@ _EVAL_TENANT_NUMBER = "+10000000000"
 _EVAL_CUSTOMER_NUMBER = "+15550000002"
 
 Actor = str
+
+
+def _digits_from_seed(seed: str, length: int = 9) -> str:
+    """Return a deterministic decimal string for a given seed."""
+
+    value = int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16)
+    return f"{value % (10**length):0{length}d}"
+
+
+def _eval_runtime_numbers(run_key: str) -> tuple[str, str]:
+    """Return isolated tenant/customer numbers for one eval run."""
+
+    tenant_number = "+18" + _digits_from_seed(f"tenant:{run_key}")
+    customer_number = "+19" + _digits_from_seed(f"customer:{run_key}")
+    return tenant_number, customer_number
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -142,9 +160,16 @@ RUBRIC_PROACTIVE_PROPOSAL = (
 
 RUBRIC_SMS_STYLE = (
     _RUBRIC_PREAMBLE + "Evaluate ONLY whether:\n"
-    "1. Agent messages are short and SMS-appropriate (1-3 sentences each).\n"
-    "2. Each message contains at most one question.\n"
+    "1. Agent messages are concise and SMS-appropriate. Most messages should be short. It is acceptable for a denser message that combines assessment, visit invitation, pricing, and date options to run longer than 3 sentences, as long as it stays easy to scan and does not read like a long email.\n"
+    "2. The customer should not feel drowned in questions or stacked action requests. A focused question is ideal, and a proposal message may include a short scheduling instruction such as 'dites-moi la plage qui vous convient' or an invitation to ask for other dates. Fail only when a message piles on so many asks that it becomes cognitively heavy.\n"
     "Pass if BOTH are met across all agent messages."
+)
+
+RUBRIC_CONSULTATIVE_FLOW = (
+    _RUBRIC_PREAMBLE + "Evaluate ONLY whether:\n"
+    "1. When the customer already names the broad problem category themselves (for example 'drain bouche', 'fuite', or 'toilette bouchee'), the agent adds diagnostic value before giving an assessment. It should not merely mirror the customer's own label back as if that were expertise. A targeted follow-up question or a more specific narrowed hypothesis counts.\n"
+    "2. When the agent recommends a visit, it explicitly frames that next step as an offer or recommendation the customer can accept, using language equivalent to 'si vous voulez', 'si vous le souhaitez', 'je peux envoyer', or 'on peut vous envoyer'. Do NOT pass a reply that jumps straight from assessment into pricing and availability as if the visit were already assumed, even if it later asks the customer to choose a slot.\n"
+    "Pass if BOTH are met."
 )
 
 RUBRIC_LANGUAGE_MATCH = (
@@ -273,27 +298,48 @@ RUBRIC_NO_ASSUMED_HISTORY = (
     "Pass if the agent never fabricates or assumes prior history."
 )
 
+RUBRIC_GREETING_INTRODUCTION = (
+    _RUBRIC_PREAMBLE + "Evaluate ONLY the FIRST agent reply when the customer opens "
+    "with nothing more than a greeting or a very generic opener. Specifically:\n"
+    "- If the customer's first message already includes a real plumbing problem description, this rubric passes automatically and should not penalize the agent.\n"
+    "- The agent should briefly identify the company in that first reply, ideally "
+    "using the business name from the tenant profile.\n"
+    "- The first reply should then ask a simple question about the plumbing "
+    "problem or what is going on.\n"
+    "- The agent should NOT jump directly into diagnosis, pricing, booking, or "
+    "availability before the customer has described the problem.\n"
+    "- The first reply should remain short and SMS-appropriate.\n"
+    "Pass if all of these are true for the first agent reply."
+)
+
+RUBRIC_PARAGRAPH_READABILITY = (
+    _RUBRIC_PREAMBLE
+    + "Evaluate ONLY whether the agent formats denser SMS messages in a readable way. Specifically:\n"
+    "- If an agent message contains more than one chunk of information (for example: assessment + pricing, pricing + scheduling options, or booking confirmation + address/details), it should be split into short paragraphs with a blank line between them.\n"
+    "- Short simple messages with only one idea do not need paragraph breaks and should not be penalized.\n"
+    "- Fail only when a dense multi-part message is sent as one hard-to-read wall of text.\n"
+    "Pass if the agent uses paragraph breaks whenever they would materially improve SMS readability."
+)
+
 # Ordered list of (rubric, evaluation_name) for building evaluators.
 _RUBRICS = [
     (RUBRIC_DIAGNOSTIC_EXPERTISE, "diagnostic_expertise"),
+    (RUBRIC_CONSULTATIVE_FLOW, "consultative_flow"),
     (RUBRIC_PROACTIVE_PROPOSAL, "proactive_proposal"),
     (RUBRIC_SMS_STYLE, "sms_style"),
-    (RUBRIC_LANGUAGE_MATCH, "language_match"),
     (RUBRIC_NATURAL_TONE, "natural_tone"),
-    (RUBRIC_REALISTIC_QUESTIONS, "realistic_questions"),
     (RUBRIC_PRELIMINARY_FRAMING, "preliminary_framing"),
     (RUBRIC_PLAIN_LANGUAGE, "plain_language"),
-    (RUBRIC_EXPLICIT_BOOKING_DATES, "explicit_booking_dates"),
-    (RUBRIC_PHYSICALLY_OBSERVABLE, "physically_observable"),
-    (RUBRIC_MULTI_DATE_OFFER, "multi_date_offer"),
-    (RUBRIC_COMPLETE_ADDRESS, "complete_address"),
     (RUBRIC_NO_ASSUMED_HISTORY, "no_assumed_history"),
+    (RUBRIC_GREETING_INTRODUCTION, "greeting_introduction"),
+    (RUBRIC_PARAGRAPH_READABILITY, "paragraph_readability"),
 ]
 
 # Display names for the report table columns.
 _EVAL_DISPLAY_NAMES: dict[str, str] = {
     "ConversationConverged": "Converged",
     "diagnostic_expertise": "Diagnostic",
+    "consultative_flow": "Consult",
     "proactive_proposal": "Proposal",
     "sms_style": "SMS Style",
     "language_match": "Language",
@@ -307,6 +353,15 @@ _EVAL_DISPLAY_NAMES: dict[str, str] = {
     "multi_date_offer": "Multi-Date",
     "complete_address": "Address",
     "no_assumed_history": "No History",
+    "greeting_introduction": "Greeting",
+    "paragraph_readability": "Paragraphs",
+}
+
+_BOSS_EVAL_DISPLAY_NAMES: dict[str, str] = {
+    "language_match": "Language",
+    "next_work_item": "Next Work",
+    "today_then_next": "Today->Next",
+    "blocked_day": "Blocked Day",
 }
 
 
@@ -394,6 +449,12 @@ class BossEvalResult:
     passed: bool
     judge_reason: str | None = None
     error: str | None = None
+    assertions: dict[str, tuple[bool, str | None]] = field(default_factory=dict)
+    task_duration: float = 0.0
+
+
+def _boss_passed(assertions: Mapping[str, tuple[bool, str | None]]) -> bool:
+    return all(passed for passed, _reason in assertions.values())
 
 
 @dataclass
@@ -591,9 +652,16 @@ def _record_failure(
     return _result(transcript_lines, turns=turns, turn_durations=turn_durations)
 
 
+def _format_transcript_entry(speaker: str, message_index: int, message: str) -> str:
+    """Return a transcript block with clear per-message boundaries."""
+
+    return f"[{message_index}] {speaker} MESSAGE:\n{message}\n<END MESSAGE>"
+
+
 def _append_transcript(transcript_lines: list[str], speaker: str, message: str) -> None:
     """Append one transcript line."""
-    transcript_lines.append(f"{speaker}: {message}")
+    message_index = len(transcript_lines) + 1
+    transcript_lines.append(_format_transcript_entry(speaker, message_index, message))
 
 
 async def _run_customer_turn(
@@ -622,17 +690,19 @@ async def _run_agent_turn(
     customer_message: str,
     transcript_lines: list[str],
     turns: int,
+    tenant_number: str,
+    customer_phone: str,
 ) -> tuple[Dialog | Report, float, None] | tuple[None, float, ConversationResult]:
     """Run one booking-agent turn, returning (output, duration, failure)."""
     t0 = time.perf_counter()
     try:
-        provision_tenant_crm(_EVAL_TENANT_NUMBER)
+        provision_tenant_crm(tenant_number)
         agent_output = await process_message(
             conversation_id,
             customer_message,
             tenant_profile=DEMO_TENANT_PROFILE,
-            twilio_number=_EVAL_TENANT_NUMBER,
-            customer_phone=_EVAL_CUSTOMER_NUMBER,
+            twilio_number=tenant_number,
+            customer_phone=customer_phone,
         )
     except ConversationError as exc:
         duration = time.perf_counter() - t0
@@ -656,6 +726,7 @@ async def run_scenario(scenario: Scenario) -> ConversationResult:
     """
     customer_agent = build_customer_agent(scenario.persona)
     conversation_id = new_conversation_id()
+    tenant_number, customer_phone = _eval_runtime_numbers(conversation_id)
     transcript_lines: list[str] = []
     turn_durations: list[float] = []
 
@@ -680,6 +751,8 @@ async def run_scenario(scenario: Scenario) -> ConversationResult:
                 current_msg,
                 transcript_lines,
                 turns=turn,
+                tenant_number=tenant_number,
+                customer_phone=customer_phone,
             )
             turn_durations.append(duration)
 
@@ -718,8 +791,9 @@ async def run_scenario(scenario: Scenario) -> ConversationResult:
             turn_durations=turn_durations,
         )
     finally:
-        reset(conversation_id, _EVAL_TENANT_NUMBER)
-        reset_calendar(_EVAL_TENANT_NUMBER)
+        reset(conversation_id, tenant_number)
+        reset_calendar(tenant_number)
+        reset_tenant_crm(tenant_number)
 
 
 async def run_tool_use_fixture(fixture: ToolUseFixture) -> ToolUseSmokeResult:
@@ -879,6 +953,7 @@ async def run_boss_french_language_eval() -> BossEvalResult:
     target_date = _next_weekday(date.today(), 3)
     target_iso = target_date.isoformat()
     boss_message = f"Qu'est-ce que j'ai le {target_iso}?"
+    started = time.perf_counter()
 
     with (
         tempfile.TemporaryDirectory() as td,
@@ -916,6 +991,8 @@ async def run_boss_french_language_eval() -> BossEvalResult:
                 output_message=None,
                 passed=False,
                 error=str(exc),
+                assertions={"language_match": (False, str(exc))},
+                task_duration=time.perf_counter() - started,
             )
 
     grading = await judge_input_output(
@@ -929,20 +1006,217 @@ async def run_boss_french_language_eval() -> BossEvalResult:
         model=build_judge_model(),
     )
 
+    assertions = {"language_match": (grading.pass_, grading.reason)}
     return BossEvalResult(
         scenario_name="boss_french_language_match",
         input_message=boss_message,
         output_message=boss_result.message,
-        passed=grading.pass_,
+        passed=_boss_passed(assertions),
         judge_reason=grading.reason,
         error=None if grading.pass_ else grading.reason,
+        assertions=assertions,
+        task_duration=time.perf_counter() - started,
+    )
+
+
+async def run_boss_next_work_item_eval() -> BossEvalResult:
+    """Check that the boss can get the next work item with a card link."""
+
+    target_date = _next_weekday(date.today(), 2)
+    target_iso = target_date.isoformat()
+    boss_message = "C'est quoi mon prochain service call ?"
+    started = time.perf_counter()
+
+    with (
+        tempfile.TemporaryDirectory() as td,
+        patch.dict(
+            os.environ,
+            {
+                "MONTFERRAND_DATA_DIR": td,
+                "MONTFERRAND_BASE_URL": "https://montferrand.test",
+            },
+            clear=False,
+        ),
+    ):
+        provision_tenant_crm(_EVAL_TENANT_NUMBER)
+        backend = get_tenant_calendar(_EVAL_TENANT_NUMBER)
+        backend.create_service_call(
+            target_iso,
+            "09:00",
+            "12:00",
+            "Inspection fuite sous evier",
+            "Jean Tremblay",
+            _EVAL_CUSTOMER_NUMBER,
+            "123 rue Test, Longueuil, J4K 1A1",
+            "Fuite sous l'evier de cuisine.",
+        )
+        crm = get_tenant_crm(_EVAL_TENANT_NUMBER)
+        customer = await crm.upsert_customer_for_phone(
+            _EVAL_CUSTOMER_NUMBER,
+            "Jean Tremblay",
+        )
+        location = await crm.upsert_service_location_for_customer(
+            customer.customer_id,
+            "123 rue Test, Longueuil, J4K 1A1",
+        )
+        listing = backend.list_events(target_iso, target_iso, include_past=True)
+        uid = listing.events[0].uid
+        await crm.create_job_for_booking(
+            customer_id=customer.customer_id,
+            service_location_id=location.location_id,
+            conversation_id="boss-next-eval",
+            calendar_uid=uid,
+            issue_summary="Inspection fuite sous evier",
+            plumber_notes="Fuite sous l'evier de cuisine.",
+            scheduled_start=listing.events[0].start_iso,
+            scheduled_end=listing.events[0].end_iso,
+        )
+
+        try:
+            boss_result = await process_message(
+                new_conversation_id(),
+                boss_message,
+                tenant_profile=DEMO_TENANT_PROFILE,
+                twilio_number=_EVAL_TENANT_NUMBER,
+                is_boss=True,
+            )
+        except ConversationError as exc:
+            return BossEvalResult(
+                scenario_name="boss_next_work_item",
+                input_message=boss_message,
+                output_message=None,
+                passed=False,
+                error=str(exc),
+                assertions={"next_work_item": (False, str(exc))},
+                task_duration=time.perf_counter() - started,
+            )
+
+    grading = await judge_input_output(
+        inputs={"boss_message": boss_message},
+        output=boss_result.message,
+        rubric=(
+            "The boss is asking for the next service call. The reply must identify the next upcoming service work item, "
+            "must include short operational summary details (date or time, customer, and address or issue), and must include a clickable job-card link. "
+            "The reply should stay concise and operational."
+        ),
+        model=build_judge_model(),
+    )
+    assertions = {"next_work_item": (grading.pass_, grading.reason)}
+    return BossEvalResult(
+        scenario_name="boss_next_work_item",
+        input_message=boss_message,
+        output_message=boss_result.message,
+        passed=_boss_passed(assertions),
+        judge_reason=grading.reason,
+        error=None if grading.pass_ else grading.reason,
+        assertions=assertions,
+        task_duration=time.perf_counter() - started,
+    )
+
+
+async def run_boss_today_empty_next_eval() -> BossEvalResult:
+    """If today is empty, the boss should still get the next upcoming service call."""
+
+    future_date = _next_weekday(date.today(), 4)
+    future_iso = future_date.isoformat()
+    boss_message = "Qu'est-ce que j'ai aujourd'hui ?"
+    started = time.perf_counter()
+
+    with (
+        tempfile.TemporaryDirectory() as td,
+        patch.dict(
+            os.environ,
+            {
+                "MONTFERRAND_DATA_DIR": td,
+                "MONTFERRAND_BASE_URL": "https://montferrand.test",
+            },
+            clear=False,
+        ),
+    ):
+        provision_tenant_crm(_EVAL_TENANT_NUMBER)
+        backend = get_tenant_calendar(_EVAL_TENANT_NUMBER)
+        backend.create_service_call(
+            future_iso,
+            "13:00",
+            "17:00",
+            "Drain garage bloque",
+            "Sophie Laroche",
+            _EVAL_CUSTOMER_NUMBER,
+            "88 rue Principale, Saint-Lambert, J4P 1A1",
+            "Drain de garage bloque.",
+        )
+        crm = get_tenant_crm(_EVAL_TENANT_NUMBER)
+        customer = await crm.upsert_customer_for_phone(
+            _EVAL_CUSTOMER_NUMBER,
+            "Sophie Laroche",
+        )
+        location = await crm.upsert_service_location_for_customer(
+            customer.customer_id,
+            "88 rue Principale, Saint-Lambert, J4P 1A1",
+        )
+        listing = backend.list_events(future_iso, future_iso, include_past=True)
+        uid = listing.events[0].uid
+        await crm.create_job_for_booking(
+            customer_id=customer.customer_id,
+            service_location_id=location.location_id,
+            conversation_id="boss-today-next-eval",
+            calendar_uid=uid,
+            issue_summary="Drain garage bloque",
+            plumber_notes="Drain de garage bloque.",
+            scheduled_start=listing.events[0].start_iso,
+            scheduled_end=listing.events[0].end_iso,
+        )
+
+        try:
+            boss_result = await process_message(
+                new_conversation_id(),
+                boss_message,
+                tenant_profile=DEMO_TENANT_PROFILE,
+                twilio_number=_EVAL_TENANT_NUMBER,
+                is_boss=True,
+            )
+        except ConversationError as exc:
+            return BossEvalResult(
+                scenario_name="boss_today_empty_next_work_item",
+                input_message=boss_message,
+                output_message=None,
+                passed=False,
+                error=str(exc),
+                assertions={"today_then_next": (False, str(exc))},
+                task_duration=time.perf_counter() - started,
+            )
+
+    grading = await judge_input_output(
+        inputs={"boss_message": boss_message},
+        output=boss_result.message,
+        rubric=(
+            "The boss asked what is happening today. If there are no service calls today but there is a future service call, "
+            "the reply must clearly say that nothing is booked today AND then mention the next upcoming service call. "
+            "It should not leave the impression that there is nothing scheduled at all. Including the job-card link is desirable and acceptable."
+        ),
+        model=build_judge_model(),
+    )
+    assertions = {"today_then_next": (grading.pass_, grading.reason)}
+    return BossEvalResult(
+        scenario_name="boss_today_empty_next_work_item",
+        input_message=boss_message,
+        output_message=boss_result.message,
+        passed=_boss_passed(assertions),
+        judge_reason=grading.reason,
+        error=None if grading.pass_ else grading.reason,
+        assertions=assertions,
+        task_duration=time.perf_counter() - started,
     )
 
 
 async def run_boss_smokes() -> list[BossEvalResult]:
     """Run all boss-specific eval smokes."""
 
-    return [await run_boss_french_language_eval()]
+    return [
+        await run_boss_french_language_eval(),
+        await run_boss_next_work_item_eval(),
+        await run_boss_today_empty_next_eval(),
+    ]
 
 
 async def run_tool_use_smokes() -> list[ToolUseSmokeResult]:
@@ -1053,7 +1327,30 @@ de toi. En realite, ton drain de sous-sol est encore bloque, l'eau ne coule
 plus du tout, et tu vois de l'eau stagnante autour du drain. Il n'y a pas
 d'odeur. Les autres drains de la maison fonctionnent. Tu es disponible
 n'importe quand cette semaine. Tu es un peu impatient parce que le probleme
-revient. Tu ecris en francais, de facon directe et un peu bourrue.""",
+    revient. Tu ecris en francais, de facon directe et un peu bourrue.""",
+)
+
+GREETING_ONLY = Scenario(
+    persona="""\
+Tu es Isabelle Desrosiers. Tu habites au 312 rue Bourget, Longueuil, J4L 2V1.
+Tu as un probleme de plomberie reel: l'eau coule sous le lavabo de la salle de
+bain quand tu ouvres le robinet. Mais tu ne commences PAS par expliquer le
+probleme. Ton tout premier message doit etre seulement: "bonjour".
+Ensuite, laisse la compagnie guider la conversation et reponds naturellement.
+Tu ecris en francais, tres simplement, comme par texto.""",
+)
+
+SELF_DIAGNOSED_DRAIN = Scenario(
+    persona="""\
+Tu es Jonathan Pelletier. Tu habites au 789 rue Louis-Hebert, Longueuil, J4J 4P9.
+Ton tout premier message doit etre exactement: "Bonjour, possible de m'aider avec un problème?"
+Si l'agent te demande quel est le probleme, reponds exactement: "j'ai un drain bouché au sous-sol."
+Si l'agent te demande quel drain exact, reponds: "le drain dans mon garage au sous-sol."
+Si l'agent te demande si d'autres drains sont touches, reponds que non, c'est le seul; quand il pleut beaucoup, de l'eau de pluie entre dans le garage et elle ne s'évacue pas.
+Tu veux de l'aide rapidement, mais tu restes calme et coopératif.
+Si l'agent propose plusieurs rendez-vous, choisis le premier rendez-vous du matin qui te convient.
+Donne ton nom complet seulement quand on te le demande. Donne ton adresse complète seulement quand on te la demande.
+Tu ecris en francais, de façon simple et naturelle comme par texto.""",
 )
 
 SCENARIOS = {
@@ -1062,6 +1359,8 @@ SCENARIOS = {
     "ambiguous_drain": AMBIGUOUS_DRAIN,
     "kitchen_odor": KITCHEN_ODOR,
     "returning_customer": RETURNING_CUSTOMER,
+    "greeting_only": GREETING_ONLY,
+    "self_diagnosed_drain": SELF_DIAGNOSED_DRAIN,
 }
 
 # ---------------------------------------------------------------------------
@@ -1118,6 +1417,11 @@ def _pass_fail(passed: bool) -> Text:
 def _display_name(eval_name: str) -> str:
     """Return a short display name for an evaluator."""
     return _EVAL_DISPLAY_NAMES.get(eval_name, eval_name)
+
+
+def _boss_display_name(eval_name: str) -> str:
+    """Return a short display name for a boss-specific evaluator."""
+    return _BOSS_EVAL_DISPLAY_NAMES.get(eval_name, eval_name)
 
 
 def _print_failed_transcripts(
@@ -1267,27 +1571,93 @@ def print_tool_use_report(results: list[ToolUseSmokeResult]) -> None:
 
 
 def print_boss_eval_report(results: list[BossEvalResult]) -> None:
-    """Render boss-specific eval smoke results."""
+    """Render boss-specific evals in the same summary/failures style."""
 
     console = Console()
     console.print()
     console.print("[bold]Boss Evals[/bold]")
 
-    table = Table(show_lines=True, padding=(0, 1))
-    table.add_column("Scenario", style="bold")
-    table.add_column("Status", justify="center")
-    table.add_column("Output", max_width=70)
-    table.add_column("Reason", max_width=80)
+    if not results:
+        console.print("[dim]No boss evals to report.[/dim]")
+        return
+
+    assertion_names: list[str] = []
+    for result in results:
+        for name in result.assertions:
+            if name not in assertion_names:
+                assertion_names.append(name)
+    if not assertion_names:
+        assertion_names = ["overall"]
+
+    table = Table(
+        title="Boss Eval Summary",
+        title_style="bold",
+        show_lines=True,
+        padding=(0, 1),
+    )
+    table.add_column("Case", style="bold")
+    for name in assertion_names:
+        table.add_column(_boss_display_name(name), justify="center")
+    table.add_column("Time", justify="right")
 
     for result in results:
-        table.add_row(
-            result.scenario_name,
-            _pass_fail(result.passed),
-            result.output_message or "-",
-            result.error or result.judge_reason or "",
-        )
+        row: list[str | Text] = [result.scenario_name]
+        if result.assertions:
+            for name in assertion_names:
+                assertion = result.assertions.get(name)
+                row.append(_pass_fail(assertion[0]) if assertion else Text("—"))
+        else:
+            row.append(_pass_fail(result.passed))
+            for _ in assertion_names[1:]:
+                row.append(Text("—"))
+        row.append(f"{result.task_duration:.1f}s")
+        table.add_row(*row)
+
+    avg_duration = sum(result.task_duration for result in results) / len(results)
+    avg_cells: list[str | Text] = [Text("Averages", style="bold dim")]
+    pass_rate = f"{sum(1 for result in results if result.passed)}/{len(results)}"
+    avg_cells.append(Text(pass_rate, style="dim"))
+    avg_cells.extend(Text("", style="dim") for _ in assertion_names[1:])
+    avg_cells.append(Text(f"{avg_duration:.1f}s", style="dim"))
+    table.add_row(*avg_cells)
 
     console.print(table)
+
+    failure_rows: list[tuple[str, str, str]] = []
+    for result in results:
+        if result.assertions:
+            for name, (passed, reason) in result.assertions.items():
+                if not passed:
+                    failure_rows.append(
+                        (
+                            result.scenario_name,
+                            _boss_display_name(name),
+                            reason or result.error or result.judge_reason or "",
+                        )
+                    )
+        elif not result.passed:
+            failure_rows.append(
+                (
+                    result.scenario_name,
+                    "Overall",
+                    result.error or result.judge_reason or "",
+                )
+            )
+
+    if failure_rows:
+        console.print()
+        failure_table = Table(
+            title="Boss Failures",
+            title_style="bold",
+            show_lines=True,
+            padding=(0, 1),
+        )
+        failure_table.add_column("Scenario", style="bold", no_wrap=True)
+        failure_table.add_column("Eval", no_wrap=True)
+        failure_table.add_column("Reason", max_width=80)
+        for scenario, eval_name, reason in failure_rows:
+            failure_table.add_row(scenario, eval_name, reason)
+        console.print(failure_table)
 
 
 # ---------------------------------------------------------------------------

@@ -58,9 +58,14 @@ from montferrand_agent.agent import (
 )
 from montferrand_agent.calendar import get_tenant_calendar
 from montferrand_agent.config import conversations_dir
-from montferrand_agent.crm import get_tenant_crm, render_customer_context_for_prompt
+from montferrand_agent.crm import (
+    maybe_get_tenant_crm,
+    render_customer_context_for_prompt,
+    reset_tenant_crm,
+    tenant_crm_dir,
+)
 from montferrand_agent.models import AgentTurn, BossReply, Dialog, Report
-from montferrand_agent.tenant import phone_to_filename
+from montferrand_agent.tenant import phone_to_filename, tenant_exists
 
 
 class ConversationError(RuntimeError):
@@ -337,11 +342,12 @@ def reset(conversation_id: str, twilio_number: str) -> None:
 
 
 def reset_tenant(twilio_number: str) -> int:
-    """Delete all conversation data and calendar events for a tenant.
+    """Delete all conversation data and reset tenant calendar and CRM state.
 
     Removes the tenant's conversation subdirectory and all NDJSON files
-    in it, plus the tenant's calendar vdir.  Also clears any matching
-    in-memory state.
+    in it, plus the tenant's calendar vdir. Also clears any matching
+    in-memory state and reprovisions a fresh empty tenant CRM database
+    when one exists for the tenant.
 
     Returns the number of conversation files deleted.
     """
@@ -366,6 +372,10 @@ def reset_tenant(twilio_number: str) -> int:
 
     # Wipe the tenant's calendar
     get_tenant_calendar(twilio_number).reset()
+
+    # Wipe and reprovision the tenant CRM when this tenant has CRM state.
+    if tenant_exists(twilio_number) or tenant_crm_dir(twilio_number).exists():
+        reset_tenant_crm(twilio_number)
 
     return count
 
@@ -488,7 +498,7 @@ async def _run_agent(
     Otherwise uses the customer-facing booking agent.
     """
     calendar = get_tenant_calendar(twilio_number)
-    crm = get_tenant_crm(twilio_number)
+    crm = maybe_get_tenant_crm(twilio_number)
     agent_factory = get_boss_agent if is_boss else get_agent
     agent = cast(Any, agent_factory())
     turn_started_at = time.perf_counter()
@@ -507,6 +517,7 @@ async def _run_agent(
                 crm=crm,
                 customer_phone=customer_phone,
                 conversation_id=conversation_id,
+                twilio_number=twilio_number,
             ),
         ) as run:
             any_run = cast(Any, run)
@@ -710,11 +721,14 @@ async def process_message(
                     "- No CRM record is available for this sender phone number."
                 )
                 if customer_phone:
-                    crm = get_tenant_crm(twilio_number)
-                    crm_context = await crm.get_customer_context_by_phone(
-                        customer_phone
-                    )
-                    customer_context = render_customer_context_for_prompt(crm_context)
+                    crm = maybe_get_tenant_crm(twilio_number)
+                    if crm is not None:
+                        crm_context = await crm.get_customer_context_by_phone(
+                            customer_phone
+                        )
+                        customer_context = render_customer_context_for_prompt(
+                            crm_context
+                        )
                 instructions = render_prompt(
                     tenant_profile,
                     customer_crm_context=customer_context,
