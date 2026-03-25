@@ -9,9 +9,10 @@ tasks:
 
   deploy:web:
     desc: Build and deploy the web app to Cloudflare Pages
+    dir: web
     aliases:
       - deploy-web
     deps:
       - build:web
     cmds:
-      - node scripts/deploy-web.mjs
+      - npx wrangler pages deploy dist --project-name "${CLOUDFLARE_PAGES_PROJECT:-montferrand}" --commit-dirty=true

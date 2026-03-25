@@ -83,7 +83,7 @@ task deploy:web
 Notes:
 
 - `task build:web` just runs `npm run build` inside `web/`.
-- `task deploy:web` builds first, then runs `node scripts/deploy-web.mjs`.
+- `task deploy:web` builds first, then runs `npx wrangler pages deploy dist --project-name "${CLOUDFLARE_PAGES_PROJECT:-montferrand}" --commit-dirty=true` inside `web/`.
 - There is no `lint` script and no web test runner configured.
 - `npm run astro -- check` currently prompts to install `@astrojs/check` and `typescript`.
 
